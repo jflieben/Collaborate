@@ -1,0 +1,308 @@
+/* Collaborate portal.
+   Every brand-dependent value is a custom property set at runtime from the
+   branding the administrator saved, so changing a colour never needs a
+   redeploy. Anything hard-coded here is structural, not decorative. */
+
+:root {
+  /* SURFACE: painted behind things. --brand-on-primary is the text that sits
+     on top of it, picked for contrast at runtime. */
+  --brand-primary: #0f5c8c;
+  --brand-on-primary: #ffffff;
+  /* INK: the brand colour used AS text, on the page's own background. Derived
+     at runtime from the primary and accent, because a brand colour light enough
+     to sit behind a dark logo is far too light to read as a link. */
+  --brand-ink: #0f5c8c;
+  --brand-accent: #b8501f;
+  --brand-on-accent: #ffffff;
+
+  --bg: #f3f2f1;
+  --surface: #ffffff;
+  --text: #201f1e;
+  --muted: #605e5c;
+  --line: #e1dfdd;
+  --danger: #a4262c;
+  --warn: #8a6100;
+  --warn-bg: #fff4ce;
+  --ok: #107c10;
+  --radius: 8px;
+  --shadow: 0 1px 3px rgba(0, 0, 0, .10), 0 4px 16px rgba(0, 0, 0, .06);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1a19;
+    --surface: #252423;
+    --text: #f3f2f1;
+    --muted: #a19f9d;
+    --line: #3b3a39;
+    --warn-bg: #4a3b0d;
+    --shadow: none;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+}
+
+a { color: var(--brand-ink); }
+
+h1, h2, h3 { line-height: 1.25; margin: 0 0 8px; }
+h1 { font-size: 26px; }
+h2 { font-size: 19px; }
+h3 { font-size: 16px; }
+p { margin: 0 0 12px; }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+[hidden] { display: none !important; }
+
+/* ---------- top bar ---------- */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 12px 24px; background: var(--brand-primary); color: var(--brand-on-primary);
+}
+.brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.brand img { max-height: 36px; max-width: 180px; display: block; }
+.brand .title { font-weight: 600; font-size: 17px; }
+.brand .subtitle { font-size: 13px; opacity: .85; }
+.userbox { display: flex; align-items: center; gap: 12px; font-size: 14px; white-space: nowrap; }
+
+/* ---------- layout ---------- */
+.container { max-width: 1080px; margin: 0 auto; padding: 24px; }
+.card {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 20px; margin-bottom: 16px; box-shadow: var(--shadow);
+}
+.row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.spread { justify-content: space-between; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+
+/* ---------- home cards ---------- */
+.choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+.choice {
+  display: flex; flex-direction: column; gap: 8px; text-align: left; cursor: pointer;
+  background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--brand-accent);
+  border-radius: var(--radius); padding: 24px; font: inherit; color: inherit;
+  box-shadow: var(--shadow); transition: transform .12s ease, box-shadow .12s ease;
+}
+.choice:hover, .choice:focus-visible { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0, 0, 0, .14); }
+.choice .icon { font-size: 30px; line-height: 1; }
+.choice .label { font-size: 18px; font-weight: 600; }
+.choice .hint { color: var(--muted); font-size: 14px; }
+.choice[disabled] { opacity: .55; cursor: not-allowed; transform: none; box-shadow: var(--shadow); }
+
+/* ---------- tabs ---------- */
+.tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 16px; border-bottom: 1px solid var(--line); }
+.tab {
+  border: none; background: none; font: inherit; color: var(--muted);
+  padding: 10px 14px; cursor: pointer; border-bottom: 3px solid transparent;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--brand-ink); border-bottom-color: var(--brand-accent); font-weight: 600; }
+
+/* ---------- forms ---------- */
+.field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 14px; }
+.field > span { font-weight: 600; font-size: 14px; }
+.field small { color: var(--muted); font-size: 13px; }
+input[type=text], input[type=email], input[type=number], input[type=url], select, textarea {
+  font: inherit; color: var(--text); background: var(--surface);
+  border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; width: 100%;
+}
+input[type=color] { width: 56px; height: 36px; padding: 2px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
+textarea { min-height: 90px; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 13px; }
+input:focus-visible, select:focus-visible, textarea:focus-visible, .tab:focus-visible, .btn:focus-visible, .choice:focus-visible {
+  outline: 2px solid var(--brand-accent); outline-offset: 1px;
+}
+.checkline { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; }
+.checkline input { margin-top: 4px; }
+
+.btn {
+  font: inherit; font-weight: 600; padding: 9px 16px; border-radius: 4px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--surface); color: var(--text);
+}
+.btn:hover { border-color: var(--muted); }
+.btn.primary { background: var(--brand-accent); color: var(--brand-on-accent); border-color: transparent; }
+.btn.primary:hover { filter: brightness(.93); }
+.btn.ghost { background: none; }
+.btn[disabled] { opacity: .5; cursor: not-allowed; }
+.btn.small { padding: 5px 10px; font-size: 13px; }
+
+/* ---------- banners, pills, status ---------- */
+.banner {
+  display: flex; gap: 12px; align-items: flex-start; justify-content: space-between;
+  border-left: 4px solid var(--warn); background: var(--warn-bg); color: var(--text);
+  padding: 12px 16px; border-radius: 4px; margin-bottom: 12px;
+}
+.banner.error { border-left-color: var(--danger); background: #fde7e9; color: #4a1417; }
+@media (prefers-color-scheme: dark) { .banner.error { background: #4a1417; color: #f9d5d8; } }
+.banner.done { border-left-color: var(--ok); background: #dff6dd; color: #0b3d0b; }
+@media (prefers-color-scheme: dark) { .banner.done { background: #123d12; color: #cdeccd; } }
+.banner .title { font-weight: 600; }
+
+.pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--line); }
+.pill.ok { background: #dff6dd; color: #0b5a0b; border-color: transparent; }
+.pill.warn { background: var(--warn-bg); color: var(--warn); border-color: transparent; }
+.pill.bad { background: #fde7e9; color: var(--danger); border-color: transparent; }
+
+.status { font-size: 14px; color: var(--muted); }
+.status.ok { color: var(--ok); }
+.status.bad { color: var(--danger); }
+
+/* ---------- tables ---------- */
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 8px 12px 8px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 13px; color: var(--muted); font-weight: 600; }
+
+/* ---------- search-before-invite ---------- */
+/* Results are buttons, not links: picking one fills the box rather than
+   navigating, so nothing is lost if the user changes their mind. */
+.match {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px; width: 100%;
+  text-align: left; padding: 10px 12px; margin-bottom: 6px; cursor: pointer;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 6px; color: inherit; font: inherit;
+}
+.match:hover, .match:focus-visible { border-color: var(--brand-accent); }
+.match[disabled] { opacity: .55; cursor: not-allowed; }
+.matches-title { margin: 4px 0 8px; }
+.icon-cell { display: inline-block; width: 1.5em; flex: none; }
+
+/* Picker rows: a container, never a button, so the controls inside stay real
+   buttons and the keyboard works. */
+.pick-row {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 6px; padding-right: 12px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 6px;
+}
+.pick-row:hover, .pick-row:focus-within { border-color: var(--brand-accent); }
+.pick-main {
+  display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0;
+  text-align: left; padding: 10px 12px; cursor: pointer;
+  background: none; border: none; color: inherit; font: inherit;
+}
+.pick-main[disabled] { opacity: .55; cursor: not-allowed; }
+.pick-main strong { overflow-wrap: anywhere; }
+.pick-peek {
+  flex: none; font-size: 12px; color: var(--muted); text-decoration: none;
+  padding: 4px 8px; border-radius: 4px; white-space: nowrap;
+}
+.pick-peek:hover, .pick-peek:focus-visible { color: var(--brand-ink); text-decoration: underline; }
+.linkish {
+  border: none; background: none; padding: 0; font: inherit; cursor: pointer;
+  color: var(--brand-ink); text-decoration: underline;
+}
+
+/* ---------- gate + wizard ---------- */
+.gate { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+.gate .card { max-width: 460px; width: 100%; text-align: center; }
+.gate .logo { max-height: 56px; max-width: 240px; margin: 0 auto 16px; display: block; }
+
+.overlay {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, .45);
+  display: flex; align-items: flex-start; justify-content: center; padding: 24px; overflow-y: auto; z-index: 40;
+}
+.overlay .card { max-width: 720px; width: 100%; margin: 24px 0; }
+.steps { display: flex; gap: 8px; font-size: 13px; color: var(--muted); margin-bottom: 16px; flex-wrap: wrap; }
+.steps .step.active { color: var(--brand-ink); font-weight: 600; }
+
+.check { display: flex; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.check .mark { font-size: 18px; line-height: 1.3; }
+.check .mark.ok { color: var(--ok); }
+.check .mark.bad { color: var(--danger); }
+.check .mark.warn { color: var(--warn); }
+
+/* ---------- email editor ---------- */
+.editor { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+@media (max-width: 900px) { .editor { grid-template-columns: 1fr; } }
+.tokens { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 12px; }
+.token {
+  font-family: ui-monospace, Consolas, monospace; font-size: 12px; padding: 3px 8px; cursor: pointer;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 4px; color: var(--text);
+}
+.token:hover { border-color: var(--brand-accent); }
+.preview { border: 1px solid var(--line); border-radius: 4px; background: #fff; min-height: 320px; width: 100%; }
+.preview-subject { font-weight: 600; padding: 8px 0; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+
+/* ---------- toasts ---------- */
+#toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 60; max-width: 420px; }
+.toast {
+  background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--brand-accent);
+  border-radius: 4px; padding: 12px 14px; box-shadow: 0 4px 20px rgba(0, 0, 0, .18);
+  display: flex; gap: 12px; align-items: flex-start;
+}
+.toast.ok { border-left-color: var(--ok); }
+.toast.bad { border-left-color: var(--danger); }
+.toast.out { opacity: 0; transition: opacity .25s ease; }
+.toast-close { border: none; background: none; font-size: 18px; line-height: 1; cursor: pointer; color: var(--muted); }
+
+.spinner {
+  display: inline-block; width: 14px; height: 14px; border: 2px solid var(--line);
+  border-top-color: var(--brand-accent); border-radius: 50%; animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; }
+  .choice { transition: none; }
+}
+
+/* ---------- colophon ---------- */
+/* One quiet line at the foot of every screen, including the sign-in gate. It is
+   attribution, not marketing: it should be findable rather than noticeable, so
+   it sits well below body text weight and only asserts itself on hover. */
+.colophon {
+  text-align: center; padding: 32px 16px 20px; font-size: 11px;
+  color: var(--muted); opacity: .5; letter-spacing: .01em;
+}
+.colophon a { color: inherit; text-decoration: none; }
+.colophon a:hover, .colophon a:focus-visible { text-decoration: underline; }
+.colophon:hover { opacity: .75; }
+#footVersion:not(:empty)::after { content: " \00B7 "; }
+
+/* ---------- one collaborator, in a drawer ---------- */
+/* A side sheet rather than a modal on top of a modal. Everything about one
+   person is on a single surface, and picking an action replaces the contents of
+   that surface instead of stacking a second window over the first. */
+.drawer { position: fixed; inset: 0; z-index: 70; display: flex; justify-content: flex-end; }
+.drawer-scrim { position: absolute; inset: 0; background: rgba(0, 0, 0, .35); }
+.drawer-panel {
+  position: relative; width: min(560px, 100%); height: 100%; overflow-y: auto;
+  background: var(--surface); border-left: 1px solid var(--line);
+  box-shadow: -8px 0 32px rgba(0, 0, 0, .18);
+  animation: drawer-in .16s ease-out;
+}
+@keyframes drawer-in { from { transform: translateX(24px); opacity: .4; } to { transform: none; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .drawer-panel { animation: none; } }
+.drawer-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+  padding: 20px 24px 16px; border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; background: var(--surface); z-index: 1;
+}
+.drawer-head h2 { margin: 0; overflow-wrap: anywhere; }
+.drawer-body { padding: 20px 24px 32px; }
+.drawer-body h3 { margin: 24px 0 8px; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.drawer-body h3:first-child { margin-top: 0; }
+
+/* Facts as label-over-value pairs: scannable without a table's furniture. */
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px 20px; }
+.fact .k { font-size: 12px; color: var(--muted); }
+.fact .v { overflow-wrap: anywhere; }
+
+/* What a guest can reach. */
+.access-list { display: flex; flex-direction: column; gap: 6px; }
+.access-row {
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--surface);
+}
+.access-row .grow { flex: 1; min-width: 0; }
+.access-row a { text-decoration: none; }
+.access-row a:hover { text-decoration: underline; }
+
+/* Actions: one obvious next step, the rest quieter, and anything unavailable
+   stated as a sentence rather than offered as a button that cannot be pressed. */
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.actions-blocked { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }

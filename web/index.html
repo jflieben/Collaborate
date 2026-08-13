@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Collaborate</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!-- MSAL browser (delegated / authorization-code + PKCE). Bundled locally so
+       there is no external CDN dependency and content filtering cannot break
+       sign-in. -->
+  <script src="msal-browser.min.js"></script>
+  <!-- authConfig.js is written by the deploy script with your tenant's values -->
+  <script src="authConfig.js"></script>
+</head>
+
+<body>
+  <!-- Sign-in gate. Shown before any token exists, so its branding comes from the
+       public branding file rather than the API. -->
+  <div id="gate" class="gate" hidden>
+    <div class="card">
+      <img id="gateLogo" class="logo" alt="" hidden />
+      <h1 id="gateTitle">Collaborate</h1>
+      <p id="gateSubtitle" class="muted">Invite and manage the people you work with outside the company.</p>
+      <p id="gateError" class="status bad" hidden></p>
+      <p><button id="signInBtn" class="btn primary">Sign in</button></p>
+      <p class="small muted">You will be signed in with your work account.</p>
+    </div>
+  </div>
+
+  <header id="topbar" class="topbar" hidden>
+    <div class="brand">
+      <img id="brandLogo" alt="" hidden />
+      <div>
+        <div class="title" id="brandTitle">Collaborate</div>
+        <div class="subtitle" id="brandSubtitle"></div>
+      </div>
+    </div>
+    <div class="userbox">
+      <span id="userName"></span>
+      <button id="signOutBtn" class="btn ghost small">Sign out</button>
+    </div>
+  </header>
+
+  <main id="app" class="container" hidden>
+    <div id="banners"></div>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-view="home" role="tab">Home</button>
+      <button class="tab" data-view="guests" role="tab">Collaborators</button>
+      <button class="tab admin-only" data-view="config" role="tab" hidden>Configuration</button>
+      <button class="tab admin-only" data-view="branding" role="tab" hidden>Branding</button>
+      <button class="tab admin-only" data-view="emails" role="tab" hidden>Emails</button>
+      <button class="tab" data-view="log" role="tab">Activity</button>
+      <button class="tab admin-only" data-view="diag" role="tab" hidden>Diagnostics</button>
+    </nav>
+
+    <!-- ---------------- Home ---------------- -->
+    <section id="view-home" class="view">
+      <h1 id="homeHeading">What would you like to do?</h1>
+      <p class="muted" id="homeIntro">Everything you set up here is recorded against your name, with an end date, so nothing is left open forever.</p>
+      <!-- Shown until /api/me answers. A cold start takes a few seconds, and an
+           empty screen with no explanation reads as a broken page. -->
+      <div class="card" id="homeLoading">
+        <p class="row"><span class="spinner"></span> Getting things ready...</p>
+        <p class="small muted">Collaborate is waking up. This takes a few seconds the first time somebody opens it after a quiet period.</p>
+      </div>
+      <!-- What just happened, stated where the eye lands next. A toast that has
+           already faded is the same as no confirmation at all. -->
+      <div class="banner done" id="homeResult" hidden>
+        <div style="flex:1">
+          <div class="title" id="homeResultTitle"></div>
+          <div class="small" id="homeResultBody"></div>
+          <div class="row" style="margin-top:10px">
+            <button class="btn small" data-view-link="guests">See your collaborators</button>
+            <button id="homeResultDismiss" class="btn small ghost">Dismiss</button>
+          </div>
+        </div>
+      </div>
+      <div class="choices" id="homeChoices"></div>
+    </section>
+
+    <!-- ---------------- External collaborators ---------------- -->
+    <section id="view-guests" class="view" hidden>
+      <div class="row spread">
+        <h1>Your external collaborators</h1>
+        <button id="guestsInvite" class="btn primary">Invite someone new</button>
+      </div>
+      <p class="muted" id="guestsIntro">Everybody here is recorded against your name, with a reason and an end date, so nothing stays open forever.</p>
+      <p id="guestsSignInNote" class="small muted" hidden></p>
+      <p id="guestsCantInvite" class="status" hidden></p>
+      <div class="card">
+        <div class="row spread">
+          <div id="guestsCounts" class="row small"></div>
+          <label class="row small admin-only" hidden><input id="guestsAll" type="checkbox" /> Show every external account, not just mine</label>
+        </div>
+
+        <div class="row" id="guestsFilters" hidden>
+          <label class="small">Status
+            <select id="guestsState">
+              <option value="">any</option>
+              <option value="pending">waiting to accept</option>
+              <option value="active">active</option>
+              <option value="expiring">ending soon</option>
+              <option value="expired">ended</option>
+              <option value="blocked">switched off</option>
+              <option value="deleted">removed</option>
+            </select>
+          </label>
+          <label class="row small"><input id="guestsUnowned" type="checkbox" /> only those nobody owns</label>
+          <input id="guestsFilter" type="text" placeholder="filter by name, address or domain" style="flex:1;min-width:200px" />
+        </div>
+
+        <div class="banner" id="guestsBulk" hidden>
+          <div style="flex:1">
+            <div class="title" id="guestsSelected"></div>
+            <div class="row">
+              <input id="guestsOwner" type="text" autocomplete="off" placeholder="make this colleague responsible" style="flex:1;min-width:220px" />
+              <input id="guestsOwnerId" type="hidden" />
+              <button id="guestsAssign" class="btn small primary">Assign</button>
+              <button id="guestsClearSel" class="btn small ghost">Clear</button>
+              <span id="guestsAssignStatus" class="status"></span>
+            </div>
+            <div id="guestsOwnerMatches"></div>
+          </div>
+        </div>
+
+        <div id="guestTable" class="table-wrap"></div>
+        <p id="guestsEmpty" class="muted" hidden>Nobody yet. Use <strong>Invite someone new</strong> to get started.</p>
+        <p><button id="guestsRefresh" class="btn small ghost">Refresh</button> <span id="guestsStatus" class="status" role="status"></span></p>
+      </div>
+    </section>
+
+    <!-- ---------------- One collaborator, in full ----------------
+         A drawer rather than a dialog on top of a dialog: everything about one
+         person lives on a single surface, and choosing an action replaces its
+         contents rather than stacking another window over the top. -->
+    <div id="guestDrawer" class="drawer" hidden>
+      <div class="drawer-scrim" data-drawer-close></div>
+      <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="gdName">
+        <header class="drawer-head">
+          <div style="min-width:0">
+            <h2 id="gdName"></h2>
+            <p class="small muted" id="gdEmail"></p>
+          </div>
+          <button class="btn ghost small" data-drawer-close aria-label="Close">Close</button>
+        </header>
+        <div class="drawer-body" id="gdBody"></div>
+      </div>
+    </div>
+
+    <!-- ---------------- Invite (search first, always) ---------------- -->
+    <section id="view-invite" class="view" hidden>
+      <div class="card">
+        <h2>Who do you want to work with?</h2>
+        <p class="muted small">Search first. If they already work with us, we will point you at the colleague who looks after them rather than setting the same person up twice.</p>
+        <label class="field" for="invSearch"><span>Name or email address</span>
+          <input id="invSearch" type="text" autocomplete="off" spellcheck="false" placeholder="jane.rivera@partner.com" />
+          <small id="invSearchHint">Start typing to see the people we already work with. Enter a full email address to invite somebody new.</small>
+        </label>
+        <div id="invMatches"></div>
+        <div class="row">
+          <button id="invCheck" class="btn primary" disabled>Continue</button>
+          <button class="btn ghost" data-view-link="guests">Cancel</button>
+          <span id="invStatus" class="status" role="status"></span>
+        </div>
+      </div>
+      <div id="invVerdict"></div>
+    </section>
+
+    <!-- ---------------- Share a file, folder or Team ---------------- -->
+    <section id="view-share" class="view" hidden>
+      <div class="steps" id="shSteps"></div>
+
+      <!-- Step 1: what -->
+      <div class="card" id="shPick">
+        <h2 id="shPickTitle">Choose what to share</h2>
+        <p class="muted small" id="shPickIntro">You will only see what you can already open yourself.</p>
+        <div class="row" id="shPanes"></div>
+        <label class="field" id="shSearchWrap" for="shSearch"><span>Search</span>
+          <input id="shSearch" type="text" autocomplete="off" placeholder="Type at least two letters" />
+        </label>
+        <p class="small muted" id="shCrumb"></p>
+        <div id="shItems"></div>
+        <p><span id="shPickStatus" class="status" role="status"></span></p>
+      </div>
+
+      <!-- Step 2: who -->
+      <div class="card" id="shWho" hidden>
+        <h2>Who should get access?</h2>
+        <p class="small">Sharing: <strong id="shChosen"></strong></p>
+        <label class="field" for="shPerson"><span>Name or email address</span>
+          <input id="shPerson" type="text" autocomplete="off" spellcheck="false" placeholder="jane.rivera@partner.com" />
+        </label>
+        <div id="shMatches"></div>
+        <div id="shNewGuest"></div>
+        <p><span id="shWhoStatus" class="status" role="status"></span></p>
+      </div>
+
+      <!-- Step 3: confirm -->
+      <div class="card" id="shConfirm" hidden>
+        <h2>Check and share</h2>
+        <div id="shSummary"></div>
+        <label class="field" id="shRoleWrap" for="shRole"><span>What may they do?</span>
+          <select id="shRole">
+            <option value="read">View only</option>
+            <option value="write">View and edit</option>
+          </select>
+        </label>
+        <label class="field" for="shMessage"><span>Add a note to the email (optional)</span>
+          <textarea id="shMessage" maxlength="500" rows="3"></textarea>
+        </label>
+        <div class="row">
+          <button id="shGo" class="btn primary">Share</button>
+          <span id="shStatus" class="status" role="status"></span>
+        </div>
+      </div>
+
+      <p class="row">
+        <button id="shBack" class="btn ghost" hidden>Back</button>
+        <button class="btn ghost" data-view-link="home">Cancel</button>
+      </p>
+    </section>
+
+    <!-- ---------------- Not built yet ---------------- -->
+    <section id="view-soon" class="view" hidden>
+      <div class="card">
+        <h2 id="soonTitle">Not available yet</h2>
+        <p id="soonText" class="muted"></p>
+        <button class="btn" data-view-link="home">Back</button>
+      </div>
+    </section>
+
+    <!-- ---------------- Configuration (admin) ---------------- -->
+    <section id="view-config" class="view" hidden>
+      <div class="card">
+        <h2>How long access lasts</h2>
+        <div class="grid">
+          <label class="field"><span>Default length (days)</span>
+            <input id="cfgDefaultDays" type="number" min="1" max="3650" />
+            <small>Pre-filled when somebody invites a guest.</small>
+          </label>
+          <label class="field"><span>Longest allowed (days)</span>
+            <input id="cfgMaxDays" type="number" min="1" max="3650" />
+            <small>Nobody can choose a date beyond this.</small>
+          </label>
+          <label class="field"><span>An extension adds (days)</span>
+            <input id="cfgRenewDays" type="number" min="1" max="3650" />
+          </label>
+          <label class="field"><span>Grace period before deletion (days)</span>
+            <input id="cfgGraceDays" type="number" min="0" max="365" />
+            <small>After expiry, sign-in is blocked first. The account is only deleted once this passes, so a mistake is recoverable.</small>
+          </label>
+          <label class="field"><span>Remind the owner this many days before (comma separated)</span>
+            <input id="cfgReminderDays" type="text" placeholder="30, 7, 1" />
+            <small>Up to five reminders.</small>
+          </label>
+          <label class="field"><span>Store the expiry date on</span>
+            <select id="cfgAttribute"></select>
+            <small>Written on the guest object itself, so it survives this tool and can drive dynamic groups or Conditional Access. It must not be in use for anything else.</small>
+          </label>
+        </div>
+        <div class="checkline"><input id="cfgAllowSelfRenew" type="checkbox" />
+          <label for="cfgAllowSelfRenew">Owners may extend their own guests without asking an administrator</label></div>
+      </div>
+
+      <div class="card">
+        <h2>Inviting</h2>
+        <div class="grid">
+          <label class="field"><span>Only this group may invite (object id)</span>
+            <input id="cfgInviterGroupId" type="text" placeholder="leave empty to let everybody invite" />
+            <small>Leave empty and any internal member can invite. Everybody can always see and manage the guests they already own.</small>
+          </label>
+          <label class="field"><span>Group name (shown to people who are refused)</span>
+            <input id="cfgInviterGroupName" type="text" />
+          </label>
+          <label class="field"><span>Domains that may be invited (comma separated)</span>
+            <input id="cfgAllowedDomains" type="text" placeholder="empty = any domain" />
+          </label>
+          <label class="field"><span>Domains that may never be invited</span>
+            <input id="cfgBlockedDomains" type="text" placeholder="gmail.com, ..." />
+          </label>
+          <label class="field"><span>Who can be found when sharing</span>
+            <select id="cfgVisibility">
+              <option value="all">Every external person in the tenant (with their owner shown)</option>
+              <option value="owned">Only the ones I own</option>
+            </select>
+            <small>Showing everybody is what stops the same person being invited five times by five colleagues.</small>
+          </label>
+        </div>
+        <div class="checkline"><input id="cfgRequireReason" type="checkbox" />
+          <label for="cfgRequireReason">Require a reason for every invitation</label></div>
+        <div class="checkline"><input id="cfgSetSponsor" type="checkbox" />
+          <label for="cfgSetSponsor">Also record the inviter as the guest's sponsor in Entra</label></div>
+      </div>
+
+      <div class="card">
+        <h2>Sharing</h2>
+        <p class="muted small">Sharing always runs as the signed-in user, so nobody can share something they do not already have access to. Switching a capability off hides it and refuses it at the API.</p>
+        <div class="checkline"><input id="cfgShareFiles" type="checkbox" /><label for="cfgShareFiles">Allow sharing files</label></div>
+        <div class="checkline"><input id="cfgShareFolders" type="checkbox" /><label for="cfgShareFolders">Allow sharing folders</label></div>
+        <div class="checkline"><input id="cfgShareTeams" type="checkbox" /><label for="cfgShareTeams">Allow adding guests to Teams</label></div>
+        <div class="checkline"><input id="cfgAllowWrite" type="checkbox" /><label for="cfgAllowWrite">Allow granting edit access (not just view)</label></div>
+      </div>
+
+      <div class="card">
+        <h2>Guests that were already here</h2>
+        <p class="muted small">Most tenants already have external accounts nobody can account for. Adoption gives each one an owner and an end date. It never blocks or removes anybody: the ordinary reminders and grace period take it from there.</p>
+        <div class="checkline"><input id="cfgAdoptionEnabled" type="checkbox" />
+          <label for="cfgAdoptionEnabled">Take on guests that Collaborate did not create</label></div>
+        <div class="grid">
+          <label class="field"><span>Give them this long, from today (days)</span>
+            <input id="cfgAdoptionDays" type="number" min="7" max="3650" />
+            <small>Counted from today, never from when the account was created, so adopting an old guest does not expire them the same afternoon. A date already on the account is respected instead.</small>
+          </label>
+        </div>
+        <div class="checkline"><input id="cfgAdoptionSponsors" type="checkbox" />
+          <label for="cfgAdoptionSponsors">Look for the owner in Entra's sponsors field</label></div>
+        <div class="checkline"><input id="cfgAdoptionAudit" type="checkbox" />
+          <label for="cfgAdoptionAudit">Also look in the invitation audit log (only covers the last 7 to 30 days)</label></div>
+      </div>
+
+      <div class="card">
+        <h2>Cleaning up inactive guests</h2>
+        <p class="muted small">Needs Entra ID P1 or P2 for sign-in data. Where that data is missing, nothing is done: a missing licence must never be read as evidence that somebody never signed in.</p>
+        <div class="checkline"><input id="cfgInactivityEnabled" type="checkbox" />
+          <label for="cfgInactivityEnabled">Act on guests who never sign in</label></div>
+        <div class="grid">
+          <label class="field"><span>Consider inactive after (days)</span>
+            <input id="cfgInactivityDays" type="number" min="30" max="3650" />
+            <small>Measured from the last successful sign-in, or from the invitation date if they never signed in.</small>
+          </label>
+          <label class="field"><span>Then</span>
+            <select id="cfgInactivityAction">
+              <option value="notify">Tell the owner only</option>
+              <option value="block">End their access (removed after the grace period)</option>
+            </select>
+            <small>Even the strongest option goes through the grace period, so it is recoverable.</small>
+          </label>
+        </div>
+        <div class="checkline"><input id="cfgInactivityOnce" type="checkbox" />
+          <label for="cfgInactivityOnce">Only warn the owner once per guest</label></div>
+      </div>
+
+      <div class="card">
+        <h2>Safety limits</h2>
+        <p class="muted small">If a run would exceed a limit, everything pauses and waits for an administrator, rather than acting on hundreds of people because of one mistake.</p>
+        <div class="checkline"><input id="cfgSafetyEnabled" type="checkbox" /><label for="cfgSafetyEnabled">Keep the safety limits on (recommended)</label></div>
+        <div class="grid">
+          <label class="field"><span>Invitations per day (whole tenant)</span><input id="cfgCapInvite" type="number" min="0" /></label>
+          <label class="field"><span>Invitations per person per day</span><input id="cfgCapPerUser" type="number" min="0" /></label>
+          <label class="field"><span>Sign-in blocks per day</span><input id="cfgCapBlock" type="number" min="0" /></label>
+          <label class="field"><span>Deletions per day</span><input id="cfgCapDelete" type="number" min="0" /></label>
+          <label class="field"><span>Never touch more than this % of guests in a day</span><input id="cfgCeiling" type="number" min="0" max="100" /></label>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>General</h2>
+        <div class="grid">
+          <label class="field"><span>Simulation mode</span>
+            <select id="cfgDryRun">
+              <option value="true">On: log everything, change nothing, send nothing</option>
+              <option value="false">Off: perform real actions</option>
+            </select>
+            <small>Keep this on until you have watched the activity log for a cycle or two.</small>
+          </label>
+          <label class="field"><span>Service desk email (recipient)</span>
+            <input id="cfgServicedesk" type="email" placeholder="servicedesk@contoso.com" />
+            <small>Where health warnings and the unowned-guest digest are sent <em>to</em>. This is not the address
+              they are sent <em>from</em>; changing it is safe and takes effect on the next save.</small>
+          </label>
+          <label class="field"><span>Shared mailbox</span>
+            <input id="cfgSender" type="text" readonly disabled />
+            <small id="cfgSenderNote"></small>
+          </label>
+          <label class="field"><span>Keep the activity log (days)</span>
+            <input id="cfgLogRetention" type="number" min="7" max="3650" />
+          </label>
+        </div>
+        <div class="checkline"><input id="cfgNotifyRedeem" type="checkbox" /><label for="cfgNotifyRedeem">Tell the owner when their guest accepts</label></div>
+        <div class="checkline"><input id="cfgOrphanDigest" type="checkbox" /><label for="cfgOrphanDigest">Email the service desk about guests nobody owns</label></div>
+      </div>
+
+      <!-- Read-only, and read live from Entra rather than from something stamped
+           at install time that would quietly go stale. -->
+      <div class="card">
+        <h2>Who administers this, and where</h2>
+        <p class="muted small">Managed in Entra, not here. Shown so you do not have to go looking for it.</p>
+        <div id="cfgAdminAccess"></div>
+      </div>
+
+      <div id="cfgWarnings"></div>
+      <div class="row">
+        <button id="cfgSave" class="btn primary">Save configuration</button>
+        <span id="cfgStatus" class="status" role="status"></span>
+      </div>
+    </section>
+
+    <!-- ---------------- Branding (admin) ---------------- -->
+    <section id="view-branding" class="view" hidden>
+      <div class="card">
+        <h2>Branding</h2>
+        <p class="muted small">Applies to this portal, to every email, and to the public page your guests land on after accepting. Saving updates all three.</p>
+        <div class="grid">
+          <label class="field"><span>Company name</span><input id="brCompany" type="text" maxlength="80" /></label>
+          <label class="field"><span>Portal title</span><input id="brTitle" type="text" maxlength="60" /></label>
+          <label class="field"><span>Portal subtitle</span><input id="brSubtitle" type="text" maxlength="160" /></label>
+          <label class="field"><span>Main colour</span>
+            <span class="row"><input id="brPrimary" type="color" /><input id="brPrimaryText" type="text" maxlength="7" style="max-width:120px" /></span>
+            <small>Header bands, in the portal and in email.</small>
+          </label>
+          <label class="field"><span>Accent colour</span>
+            <span class="row"><input id="brAccent" type="color" /><input id="brAccentText" type="text" maxlength="7" style="max-width:120px" /></span>
+            <small>Buttons and highlights.</small>
+          </label>
+        </div>
+        <div class="field">
+          <span>Logo</span>
+          <div class="row">
+            <img id="brLogoPreview" alt="" style="max-height:48px;max-width:200px" hidden />
+            <input id="brLogoFile" type="file" accept="image/png,image/jpeg" />
+            <button id="brLogoRemove" class="btn small ghost">Remove</button>
+          </div>
+          <small>PNG or JPEG, up to 512 KB. Emails embed it, so it shows even when a mail client blocks remote images.</small>
+          <small id="brLogoPending" class="status" hidden></small>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>The page guests land on</h2>
+        <p class="muted small">External people never reach this portal. After they accept an invitation they land on a small public page, which Collaborate republishes whenever you save.</p>
+        <div class="grid">
+          <label class="field"><span>Headline</span><input id="wcHeadline" type="text" maxlength="80" /></label>
+          <label class="field"><span>Button label</span><input id="wcButton" type="text" maxlength="60" /></label>
+        </div>
+        <label class="field"><span>Message</span><textarea id="wcMessage" maxlength="600"></textarea></label>
+        <label class="field"><span>Extra places a guest may be sent (one per line)</span>
+          <textarea id="wcHosts" placeholder="intranet.contoso.com&#10;.partners.contoso.com"></textarea>
+          <small>Your SharePoint, OneDrive and Teams addresses are always allowed. Anything not on this list is ignored by the page, which is what stops it being used as an open redirect.</small>
+        </label>
+        <div class="checkline"><input id="wcAuto" type="checkbox" />
+          <label for="wcAuto">Send the guest straight on after a short pause, instead of showing a button</label></div>
+        <p class="small muted">Allowed right now: <span id="wcAllowed" class="muted"></span></p>
+        <p class="small">Public page: <a id="wcLink" href="#" target="_blank" rel="noopener">not published yet</a></p>
+      </div>
+
+      <div class="row">
+        <button id="brSave" class="btn primary">Save and republish</button>
+        <span id="brStatus" class="status" role="status"></span>
+      </div>
+    </section>
+
+    <!-- ---------------- Emails (admin) ---------------- -->
+    <section id="view-emails" class="view" hidden>
+      <div class="card">
+        <h2>Emails</h2>
+        <p class="muted small">Every message Collaborate can send. Edit the wording, see it rendered as you type, and send yourself a real test.</p>
+        <div class="row">
+          <label class="field" style="flex:1;min-width:260px"><span>Message</span>
+            <select id="emKey"></select>
+            <small id="emDescription"></small>
+          </label>
+        </div>
+        <div class="checkline"><input id="emEnabled" type="checkbox" /><label for="emEnabled">Send this message</label></div>
+        <div class="editor">
+          <div>
+            <label class="field"><span>Subject</span><input id="emSubject" type="text" maxlength="200" /></label>
+            <div class="field">
+              <span>Body</span>
+              <div class="tokens" id="emTokens"></div>
+              <textarea id="emBody" rows="18"></textarea>
+              <small>Click a token to insert it. Use <code>class="cb-button"</code> on a link to make it a branded button.</small>
+            </div>
+            <div class="checkline"><input id="emShell" type="checkbox" />
+              <label for="emShell">Wrap in the branded header and footer</label></div>
+            <p id="emUnknown" class="status bad" hidden></p>
+          </div>
+          <div>
+            <div class="preview-subject" id="emPreviewSubject"></div>
+            <iframe id="emPreview" class="preview" title="Email preview" sandbox=""></iframe>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <button id="emSave" class="btn primary">Save emails</button>
+        <button id="emTest" class="btn">Send a test to me</button>
+        <button id="emReset" class="btn ghost">Reset this message to default</button>
+        <span id="emStatus" class="status" role="status"></span>
+      </div>
+    </section>
+
+    <!-- ---------------- Activity ---------------- -->
+    <section id="view-log" class="view" hidden>
+      <div class="card">
+        <div class="row spread">
+          <h2>Activity</h2>
+          <label class="row small admin-only" hidden><input id="logAll" type="checkbox" /> Show everything, not just mine</label>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>When</th><th>What</th><th>Who</th><th>Details</th></tr></thead>
+            <tbody id="logRows"></tbody>
+          </table>
+        </div>
+        <p class="row"><button id="logMore" class="btn small" hidden>Load more</button><span id="logStatus" class="status"></span></p>
+      </div>
+    </section>
+
+    <!-- ---------------- Diagnostics (admin) ---------------- -->
+    <section id="view-diag" class="view" hidden>
+      <div class="card">
+        <h2>Health</h2>
+        <div id="diagFindings"></div>
+        <div id="diagSummary" class="grid"></div>
+      </div>
+
+      <div class="card">
+        <h2>Run something now</h2>
+        <p class="muted small">Everything here also runs on a schedule. These are for when you have just changed a setting and would rather not wait until tomorrow to see whether it worked.</p>
+        <div class="row">
+          <button id="opRefresh" class="btn small">Refresh from Entra (acceptance and last active)</button>
+          <button id="opAdopt" class="btn small">Adopt guests we do not track yet</button>
+          <button id="opOrphans" class="btn small">Send the unowned digest</button>
+          <button id="opHealth" class="btn small">Run the health check</button>
+          <button id="opVersion" class="btn small">Check for a newer version</button>
+        </div>
+        <p><span id="opStatus" class="status" role="status"></span></p>
+      </div>
+      <div class="card">
+        <h2>Background jobs</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Job</th><th>Last run</th><th>Result</th><th>Took</th><th>Last error</th></tr></thead>
+            <tbody id="diagRows"></tbody>
+          </table>
+        </div>
+        <p class="small muted" id="diagEmpty" hidden>No background job has run yet.</p>
+      </div>
+      <p><button id="diagRefresh" class="btn small">Refresh</button> <span id="diagStatus" class="status"></span></p>
+    </section>
+  </main>
+
+  <!-- ---------------- Setup wizard ---------------- -->
+  <div id="wizard" class="overlay" hidden>
+    <div class="card">
+      <div class="steps" id="wizSteps"></div>
+      <div id="wizBody"></div>
+      <div class="row spread" style="margin-top:16px">
+        <button id="wizBack" class="btn ghost">Back</button>
+        <span id="wizStatus" class="status" role="status"></span>
+        <button id="wizNext" class="btn primary">Next</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Colophon. Deliberately quiet: this tool wears the tenant's branding
+       everywhere else, and one line of attribution is not a badge. -->
+  <footer class="colophon">
+    <span id="footVersion"></span><a href="https://jsolve.nl" target="_blank" rel="noopener noreferrer">Collaborate by JSolve B.V.</a>
+  </footer>
+
+  <div id="toasts"></div>
+  <script src="app.js"></script>
+</body>
+
+</html>
