@@ -1674,6 +1674,15 @@ Describe 'ConvertTo-CBSiteSettings' {
         $s.Known | Should -BeTrue
         $s.CanShareExternally | Should -BeTrue
     }
+    It 'names every key in camelCase, like every other payload' {
+        # The portal reads these case sensitively and PowerShell does not, so
+        # PascalCase here was invisible from this side: every assertion below
+        # passed while the browser saw undefined for all of them and rendered
+        # nothing at all.
+        $s = ConvertTo-CBSiteSettings -Site ([pscustomobject]@{ ShareByEmailEnabled = $true })
+        $keys = @($s.Keys)
+        @($keys | Where-Object { $_ -cmatch '^[a-z]' }).Count | Should -Be $keys.Count -Because "these keys are not camelCase: $(($keys | Where-Object { $_ -cnotmatch '^[a-z]' }) -join ', ')"
+    }
     It 'is unknown when the site could not be read at all' {
         $s = ConvertTo-CBSiteSettings -Site $null
         $s.Known | Should -BeFalse

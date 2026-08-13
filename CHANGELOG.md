@@ -4,7 +4,16 @@ All notable changes to Collaborate are documented here. The version is the singl
 source in `VERSION` (stamped into the module manifest, the `CB_VERSION` app
 setting, and the portal footer at deploy time).
 
-## 0.6.4
+## 0.7.0
+### Site sharing status was read but never shown
+
+- `siteSettings` came back with **PascalCase** keys while the portal read
+  camelCase
+- Inside a site that refuses external sharing, the picker now shows a **warning
+  above the contents** and **disables every share button**
+- A site's settings arriving **after** it was opened now redraw the screen the
+  user is on, so clicking faster than the lookup no longer loses the warning.
+
 ### Every question is asked before the work starts
 
 - The deploy takes minutes, all typed input now happens in the first half minute
@@ -29,7 +38,6 @@ setting, and the portal footer at deploy time).
 - Site settings carry SharePoint's **raw answer** alongside the conclusion, so a
   wrong verdict can be checked against the source.
 
-## 0.6.2
 ### A delegated scope on a second resource could be reconciled and still missing
 
 - `requiredResourceAccess` was patched **once per resource**, reading the
@@ -41,7 +49,6 @@ setting, and the portal footer at deploy time).
   could not read the app registration. It now says so and reports it as a
   failure.
 
-## 0.6.1
 ### Deploy: help choosing the address to allow
 
 - The deploy now lists the addresses **Entra has seen you sign in from**, grouped

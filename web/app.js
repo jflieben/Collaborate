@@ -1667,6 +1667,9 @@
   function renderPickItems(items, emptyReason) {
     var host = el("shItems");
     renderCrumb();
+    // Kept so a site's settings arriving after the user has already opened it
+    // can redraw what they are looking at.
+    state.share.shown = { items: items, emptyReason: emptyReason };
 
     // A site known to refuse external sharing, either because SharePoint said so
     // when the list was built or because it refused a share earlier. Said before
@@ -1690,7 +1693,8 @@
       return;
     }
     if (!items.length) {
-      host.innerHTML = '<p class="muted small">' + esc(emptyReason || "Nothing here.") + "</p>";
+      host.innerHTML = blockedBanner + '<p class="muted small">' + esc(emptyReason || "Nothing here.") + "</p>";
+      wireLeaveSite();
       return;
     }
     // A note that applies to a list that is not empty: sites dropped for no
@@ -1700,7 +1704,7 @@
     // gets two separate controls rather than one ambiguous click. The row is a
     // container, never a button, so the controls inside stay real buttons and
     // keyboard navigation works.
-    host.innerHTML = note + items.map(function (it, i) {
+    host.innerHTML = blockedBanner + note + items.map(function (it, i) {
       var openable = it.kind === "folder" || it.kind === "site" || it.kind === "drive";
       // What it is, where it lives, and when it was last touched. A column of
       // twenty file names is not enough to pick from: half of them are called
@@ -1737,6 +1741,7 @@
       return '<div class="pick-row">' + main + peek + action + "</div>";
     }).join("");
 
+    wireLeaveSite();
     loadSiteSettings(items);
 
     host.querySelectorAll("[data-open]").forEach(function (b) {
@@ -1760,9 +1765,37 @@
      list must never wait for this: a tenant with thirty followed sites would
      take thirty round trips to show anything. */
 
+  function wireLeaveSite() {
+    var b = el("shPickLeaveSite");
+    if (!b) { return; }
+    b.onclick = function () {
+      state.share.crumb = []; state.share.siteId = ""; state.share.siteUrl = "";
+      renderPanes();
+      loadPane("sites");
+    };
+  }
+
   function siteSettingsCache() {
     if (!state.siteSettings) { state.siteSettings = {}; }
     return state.siteSettings;
+  }
+
+  // One site, on demand. Used when somebody opens a site faster than the list
+  // sweep reached it, or arrives at one by another route.
+  function ensureSiteSettings(item) {
+    var cache = siteSettingsCache();
+    var url = safeUrl(item.webUrl);
+    if (!url || cache[url]) { return Promise.resolve(cache[url]); }
+    return api("/browse?pane=siteinfo&q=" + encodeURIComponent(url))
+      .then(function (data) { cache[url] = data.siteSettings || { known: false }; })
+      .catch(function (e) { cache[url] = { known: false, detail: e.message }; })
+      .then(function () {
+        annotateSiteRow(item);
+        // If they are already inside that site, the warning belongs on the
+        // screen they are actually looking at.
+        var s = state.share;
+        if (s && s.siteUrl === url && s.shown) { renderPickItems(s.shown.items, s.shown.emptyReason); }
+      });
   }
 
   function loadSiteSettings(items) {
@@ -1781,7 +1814,12 @@
       api("/browse?pane=siteinfo&q=" + encodeURIComponent(it.webUrl))
         .then(function (data) { cache[it.webUrl] = data.siteSettings || { known: false }; })
         .catch(function (e) { cache[it.webUrl] = { known: false, detail: e.message }; })
-        .then(function () { annotateSiteRow(it); pump(); });
+        .then(function () {
+          annotateSiteRow(it);
+          var s = state.share;
+          if (s && s.siteUrl === it.webUrl && s.shown) { renderPickItems(s.shown.items, s.shown.emptyReason); }
+          pump();
+        });
     }
     for (var i = 0; i < 4; i++) { pump(); }
   }
@@ -1832,7 +1870,10 @@
 
   function openContainer(entry, isCrumb) {
     var s = state.share;
-    if (entry.kind === "site") { s.siteId = entry.id; s.siteName = entry.name; s.siteUrl = entry.webUrl; }
+    if (entry.kind === "site") {
+      s.siteId = entry.id; s.siteName = entry.name; s.siteUrl = entry.webUrl;
+      ensureSiteSettings(entry);
+    }
     if (!isCrumb) { s.crumb.push(entry); }
     var extra = entry.kind === "site"
       ? { siteId: entry.id }

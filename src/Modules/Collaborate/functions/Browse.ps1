@@ -308,36 +308,40 @@ function ConvertTo-CBSiteSettings {
         @{ Known; CanShareExternally; Locked; Reason; Classification; Raw }
     #>
     [CmdletBinding()] param($Site)
+    # camelCase, like every other payload this API returns. PascalCase here meant
+    # the portal read undefined for every field and silently rendered nothing:
+    # JavaScript property access is case sensitive, PowerShell's is not, so it
+    # looked correct from both ends.
     $result = [ordered]@{
-        Known = $false; CanShareExternally = $true; Locked = $false
-        Reason = ''; Classification = ''; NeedsConsent = $false; Detail = ''; Raw = $null
+        known = $false; canShareExternally = $true; locked = $false
+        reason = ''; classification = ''; needsConsent = $false; detail = ''; raw = $null
     }
     if (-not $Site) { return $result }
-    $result.Known = $true
-    $result.Classification = "$($Site.Classification)"
+    $result.known = $true
+    $result.classification = "$($Site.Classification)"
     # What SharePoint actually said, so a wrong conclusion can be checked against
     # the source rather than argued about.
-    $result.Raw = [ordered]@{
+    $result.raw = [ordered]@{
         shareByEmailEnabled = "$($Site.ShareByEmailEnabled)"
         shareByLinkEnabled  = "$($Site.ShareByLinkEnabled)"
         readOnly            = "$($Site.ReadOnly)"
         writeLocked         = "$($Site.WriteLocked)"
     }
 
-    $locked = ($Site.PSObject.Properties['ReadOnly'] -and $Site.ReadOnly) -or
-              ($Site.PSObject.Properties['WriteLocked'] -and $Site.WriteLocked)
-    if ($locked) {
-        $result.Locked = $true
-        $result.CanShareExternally = $false
-        $result.Reason = 'This site is read-only or locked, so nothing in it can be shared.'
+    $isLocked = ($Site.PSObject.Properties['ReadOnly'] -and $Site.ReadOnly) -or
+                ($Site.PSObject.Properties['WriteLocked'] -and $Site.WriteLocked)
+    if ($isLocked) {
+        $result.locked = $true
+        $result.canShareExternally = $false
+        $result.reason = 'This site is read-only or locked, so nothing in it can be shared.'
         return $result
     }
 
     # Only decided when SharePoint actually said. A property that is missing
     # means the API did not answer for it, not that it is false.
     if ($Site.PSObject.Properties['ShareByEmailEnabled'] -and -not $Site.ShareByEmailEnabled) {
-        $result.CanShareExternally = $false
-        $result.Reason = 'This site does not allow sharing with people outside the company. The person who owns the site can change that in SharePoint.'
+        $result.canShareExternally = $false
+        $result.reason = 'This site does not allow sharing with people outside the company. The person who owns the site can change that in SharePoint.'
     }
     return $result
 }
@@ -361,16 +365,16 @@ function Get-CBSiteSettings {
         $detail = "$($_.Exception.Message)"
         Write-Warning "Could not read the settings of ${SiteUrl}: $detail"
         $out = ConvertTo-CBSiteSettings -Site $null
-        $out.Detail = $detail
+        $out.detail = $detail
         # Consent not granted yet is the one failure an administrator can fix,
         # and it looks identical to every other failure unless it is named. The
         # portal says it once rather than per site.
         if ($detail -match 'AADSTS65001|invalid_grant|consent|HTTP 401|Unauthorized') {
-            $out.NeedsConsent = $true
-            $out.Reason = 'Collaborate is not consented to read SharePoint site settings yet. Re-run the deployment to grant the AllSites.Read permission.'
+            $out.needsConsent = $true
+            $out.reason = 'Collaborate is not consented to read SharePoint site settings yet. Re-run the deployment to grant the AllSites.Read permission.'
         }
         elseif ($detail -match 'HTTP 403|HTTP 404|locked|archiv') {
-            $out.Reason = 'SharePoint would not answer for this site. It may be locked, archived, or not readable by you.'
+            $out.reason = 'SharePoint would not answer for this site. It may be locked, archived, or not readable by you.'
         }
         return $out
     }
