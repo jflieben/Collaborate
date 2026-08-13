@@ -218,14 +218,12 @@ window.CB_AUTH = {
 
     # The lockdown from the install is already in place, and this machine is
     # almost certainly not inside it.
-    $opened = Open-CBStorageForUpload -Account $WebStorage -ResourceGroup $ResourceGroup
-    try {
-        Invoke-Az -AzArgs @('storage', 'blob', 'upload-batch', '--account-name', $WebStorage, '--account-key', $webKey, '--destination', '$web', '--source', $webStage, '--overwrite') | Out-Null
-    }
-    finally { Close-CBStorageForUpload -Opened $opened }
-
+    $uploaded = Invoke-CBPortalUpload -Account $WebStorage -ResourceGroup $ResourceGroup -AccountKey $webKey -Source $webStage
     Remove-Item $webStage -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host "Portal redeployed to https://$WebStorage.z6.web.core.windows.net/ (clientId $appId, api https://$hostName/api)."
+    if ($uploaded) {
+        Write-Host "Portal redeployed to https://$WebStorage.z6.web.core.windows.net/ (clientId $appId, api https://$hostName/api)."
+    }
+    else { $portalBlockers += 'the portal files could not be uploaded (see the warnings above)' }
 }
 else {
     Write-Warning 'The portal was NOT redeployed, so the browser is still running the previous version:'

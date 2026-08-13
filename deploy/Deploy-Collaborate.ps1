@@ -545,15 +545,28 @@ try {
     # operator directly so somebody can administer the tool either way.
     Write-Step 'Administrator role assignment'
     $adminRoleId = Get-CBAdminAppRoleId
-    $assigned = Invoke-AzRestJson -Method POST -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo" `
-        -Body @{ principalId = $AdminGroupObjectId; resourceId = $spId; appRoleId = $adminRoleId } -AllowFail
-    if ($assigned) { Write-Host "Granted Collaborate.Admin to '$AdminGroupName'." -ForegroundColor Green }
+
+    # Already assigned is the normal case on a re-run, and POSTing it again fails
+    # with a conflict. Reporting that as "you need a P1 licence" told an operator
+    # to go and fix something that was never broken.
+    $current = Invoke-CBGraphJson -Method GET -AllowFail `
+        -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo?`$select=principalId,appRoleId&`$top=200"
+    $already = @($current.value | Where-Object { "$($_.principalId)" -eq $AdminGroupObjectId -and "$($_.appRoleId)" -eq $adminRoleId })
+
+    if ($already.Count -gt 0) {
+        Write-Host "'$AdminGroupName' already has Collaborate.Admin." -ForegroundColor Green
+    }
     else {
-        Write-Warning "Could not assign the admin group to the Collaborate.Admin role. Assigning a group to an app role requires an Entra ID P1 licence; without it, assign individual users in Entra (Enterprise applications > $webAppName > Users and groups)."
-        if ($deployerOid) {
-            $fallback = Invoke-AzRestJson -Method POST -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo" `
-                -Body @{ principalId = $deployerOid; resourceId = $spId; appRoleId = $adminRoleId } -AllowFail
-            if ($fallback) { Write-Host "Granted Collaborate.Admin to you ($deployerUpn) so the portal is administrable." -ForegroundColor Yellow }
+        $assigned = Invoke-AzRestJson -Method POST -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo" `
+            -Body @{ principalId = $AdminGroupObjectId; resourceId = $spId; appRoleId = $adminRoleId } -AllowFail
+        if ($assigned) { Write-Host "Granted Collaborate.Admin to '$AdminGroupName'." -ForegroundColor Green }
+        else {
+            Write-Warning "Could not assign the admin group to the Collaborate.Admin role. Assigning a group to an app role requires an Entra ID P1 licence; without it, assign individual users in Entra (Enterprise applications > $webAppName > Users and groups)."
+            if ($deployerOid -and -not @($current.value | Where-Object { "$($_.principalId)" -eq $deployerOid -and "$($_.appRoleId)" -eq $adminRoleId })) {
+                $fallback = Invoke-AzRestJson -Method POST -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo" `
+                    -Body @{ principalId = $deployerOid; resourceId = $spId; appRoleId = $adminRoleId } -AllowFail
+                if ($fallback) { Write-Host "Granted Collaborate.Admin to you ($deployerUpn) so the portal is administrable." -ForegroundColor Yellow }
+            }
         }
     }
 
@@ -622,15 +635,11 @@ window.CB_AUTH = {
 
     # A re-run hits the lockdown the last run applied, and the upload comes from
     # wherever the deploy is running rather than from an allowed range.
-    $opened = Open-CBStorageForUpload -Account $WebStorage -ResourceGroup $ResourceGroup -AlreadyAllowed $AllowedIp
-    try {
-        Invoke-Az -AzArgs @('storage', 'blob', 'upload-batch', '--account-name', $WebStorage, '--account-key', $webKey,
-            '--destination', '$web', '--source', $webStage, '--overwrite') | Out-Null
-    }
-    finally { Close-CBStorageForUpload -Opened $opened }
-
+    $uploaded = Invoke-CBPortalUpload -Account $WebStorage -ResourceGroup $ResourceGroup `
+        -AccountKey $webKey -Source $webStage -AlreadyAllowed $AllowedIp
     Remove-Item $webStage -Recurse -Force -ErrorAction SilentlyContinue
-    Write-Host 'Portal uploaded.' -ForegroundColor Green
+    if ($uploaded) { Write-Host 'Portal uploaded.' -ForegroundColor Green }
+    else { throw "The portal files could not be uploaded to $WebStorage." }
 }
 catch {
     Write-Warning "Portal setup did not fully complete: $($_.Exception.Message)"

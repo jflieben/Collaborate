@@ -91,6 +91,83 @@ function Show-CBSignInIpHint {
     Write-Host ' sign-in logs. Find the address from the network your employees use, e.g. https://ifconfig.me.)'
 }
 
+function Invoke-CBPortalUpload {
+    <#
+    .SYNOPSIS
+        Uploads the portal to a storage account whose firewall is already locked
+        down, and puts the firewall back exactly as it was.
+    .DESCRIPTION
+        Re-running against an existing install hits the lockdown the last run
+        applied. Two escalating steps, because the cheap one does not always
+        work:
+
+          1. Allow this machine's public address. Correct and narrow, but in
+             Cloud Shell the address the storage service sees is not always the
+             one an IP-echo service reports, and the rule can take longer than
+             the wait to take effect.
+          2. Set the account's default action to Allow for the length of the
+             upload. Deterministic whatever the source address is.
+
+        Both are undone in a finally, so a failed upload never leaves the account
+        open. This account holds the portal's static files and nothing else: no
+        data, no tokens, no secrets. The window is seconds, and it is stated in
+        the output rather than done quietly.
+    .OUTPUTS
+        $true when the portal was uploaded.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Account,
+        [Parameter(Mandatory)][string]$ResourceGroup,
+        [Parameter(Mandatory)][string]$AccountKey,
+        [Parameter(Mandatory)][string]$Source,
+        [string[]]$AlreadyAllowed
+    )
+    $upload = {
+        Invoke-Az -AzArgs @('storage', 'blob', 'upload-batch', '--account-name', $Account, '--account-key', $AccountKey,
+            '--destination', '$web', '--source', $Source, '--overwrite') -AllowFail
+    }
+
+    $rules = $null
+    try { $rules = (& az storage account show --name $Account --resource-group $ResourceGroup --query networkRuleSet --only-show-errors 2>$null) | Out-String | ConvertFrom-Json }
+    catch { }
+    $defaultAction = if ($rules) { "$($rules.defaultAction)" } else { '' }
+
+    if ($defaultAction -ne 'Deny') {
+        if ($null -ne (& $upload)) { return $true }
+        Write-Warning "Uploading the portal to $Account failed, and its firewall is not the reason."
+        return $false
+    }
+
+    $opened = Open-CBStorageForUpload -Account $Account -ResourceGroup $ResourceGroup -AlreadyAllowed $AlreadyAllowed -Rules $rules
+    $relaxed = $false
+    try {
+        if ($null -ne (& $upload)) { return $true }
+
+        Write-Host "The $Account firewall still refused the upload. Opening it for a few seconds instead..." -ForegroundColor Yellow
+        & az storage account update --name $Account --resource-group $ResourceGroup --default-action Allow --only-show-errors 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Could not relax the $Account firewall; the portal was not uploaded."
+            return $false
+        }
+        $relaxed = $true
+        Start-Sleep -Seconds 15
+        if ($null -ne (& $upload)) { return $true }
+        Write-Warning "The portal upload failed even with the $Account firewall open, so the firewall was not the cause."
+        return $false
+    }
+    finally {
+        if ($relaxed) {
+            Write-Host "Closing the $Account firewall again..." -ForegroundColor Yellow
+            & az storage account update --name $Account --resource-group $ResourceGroup --default-action Deny --bypass AzureServices --only-show-errors 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "The $Account firewall is STILL OPEN. Close it now: az storage account update --name $Account --resource-group $ResourceGroup --default-action Deny --bypass AzureServices"
+            }
+        }
+        Close-CBStorageForUpload -Opened $opened
+    }
+}
+
 function Open-CBStorageForUpload {
     <#
     .SYNOPSIS
@@ -110,12 +187,20 @@ function Open-CBStorageForUpload {
         @{ Added; Ip; Account; ResourceGroup }
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Account, [Parameter(Mandatory)][string]$ResourceGroup, [string[]]$AlreadyAllowed)
+    param(
+        [Parameter(Mandatory)][string]$Account,
+        [Parameter(Mandatory)][string]$ResourceGroup,
+        [string[]]$AlreadyAllowed,
+        # Already read by the caller, to avoid asking twice.
+        $Rules
+    )
     $none = @{ Added = $false; Ip = ''; Account = $Account; ResourceGroup = $ResourceGroup }
 
-    $rules = $null
-    try { $rules = (& az storage account show --name $Account --resource-group $ResourceGroup --query networkRuleSet --only-show-errors 2>$null) | Out-String | ConvertFrom-Json }
-    catch { return $none }
+    $rules = $Rules
+    if (-not $rules) {
+        try { $rules = (& az storage account show --name $Account --resource-group $ResourceGroup --query networkRuleSet --only-show-errors 2>$null) | Out-String | ConvertFrom-Json }
+        catch { return $none }
+    }
     if (-not $rules -or "$($rules.defaultAction)" -ne 'Deny') { return $none }
 
     $ip = Get-MyPublicIp

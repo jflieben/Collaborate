@@ -310,11 +310,19 @@ function ConvertTo-CBSiteSettings {
     [CmdletBinding()] param($Site)
     $result = [ordered]@{
         Known = $false; CanShareExternally = $true; Locked = $false
-        Reason = ''; Classification = ''; NeedsConsent = $false; Detail = ''
+        Reason = ''; Classification = ''; NeedsConsent = $false; Detail = ''; Raw = $null
     }
     if (-not $Site) { return $result }
     $result.Known = $true
     $result.Classification = "$($Site.Classification)"
+    # What SharePoint actually said, so a wrong conclusion can be checked against
+    # the source rather than argued about.
+    $result.Raw = [ordered]@{
+        shareByEmailEnabled = "$($Site.ShareByEmailEnabled)"
+        shareByLinkEnabled  = "$($Site.ShareByLinkEnabled)"
+        readOnly            = "$($Site.ReadOnly)"
+        writeLocked         = "$($Site.WriteLocked)"
+    }
 
     $locked = ($Site.PSObject.Properties['ReadOnly'] -and $Site.ReadOnly) -or
               ($Site.PSObject.Properties['WriteLocked'] -and $Site.WriteLocked)

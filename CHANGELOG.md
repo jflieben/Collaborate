@@ -4,6 +4,18 @@ All notable changes to Collaborate are documented here. The version is the singl
 source in `VERSION` (stamped into the module manifest, the `CB_VERSION` app
 setting, and the portal footer at deploy time).
 
+## 0.6.3
+### Re-running no longer warns about things that are fine
+
+- **The admin group assignment** is checked before it is attempted. Re-posting an
+  assignment that already exists fails
+- **The portal upload** Open the account for the few seconds the upload takes
+  and close it again.
+- A failed portal upload is now **fatal in the deploy** and a listed blocker in
+  the update.
+- Site settings carry SharePoint's **raw answer** alongside the conclusion, so a
+  wrong verdict can be checked against the source.
+
 ## 0.6.2
 ### A delegated scope on a second resource could be reconciled and still missing
 
