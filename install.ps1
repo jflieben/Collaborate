@@ -103,13 +103,9 @@ try {
     $SenderUpn = Read-Required $SenderUpn 'Mailbox to send from (e.g. noreply@contoso.com)'
     $ServicedeskEmail = Read-Required $ServicedeskEmail 'Service desk email (health warnings and unowned-guest digests)'
     $AdminGroupName = Read-Required $AdminGroupName 'Entra security group whose members administer Collaborate'
-    if (-not $AllowedIp -and -not $PublicWithSso -and -not $SkipNetworkLockdown) {
-        Write-Host ''
-        Write-Host 'The portal is used by ordinary employees, so restrict it to the ranges they browse from,' -ForegroundColor Yellow
-        Write-Host 'not just your own address. Leave blank to decide later.' -ForegroundColor Yellow
-        $entered = (Read-Host 'IP addresses or CIDR ranges to allow, comma separated').Trim()
-        if ($entered) { $AllowedIp = @($entered -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-    }
+    # The address to allow is NOT asked here. The deploy asks it at the network
+    # step, where it can show which addresses Entra has seen you sign in from,
+    # and asking twice for the same thing is worse than asking once late.
 
     $params = @{
         SubscriptionId   = $SubscriptionId

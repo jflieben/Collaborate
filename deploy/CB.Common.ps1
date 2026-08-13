@@ -8,6 +8,154 @@
 # Requires the dot-sourcing script to have already defined Invoke-Az (both do)
 # and az to be signed in. $PSScriptRoot always resolves to this file's folder, so
 # permissions.json is found regardless of who dot-sources it.
+#
+# The three network helpers at the top are the exception: install.ps1 dot-sources
+# this file just for those, before the deploy runs, so they call az directly and
+# depend on nothing else here.
+
+function Get-MyPublicIp {
+    foreach ($svc in @('https://api.ipify.org', 'https://ifconfig.me/ip', 'https://icanhazip.com')) {
+        try {
+            $ip = "$(Invoke-RestMethod -Method Get -Uri $svc -TimeoutSec 10 -ErrorAction Stop)".Trim()
+            if ($ip -match '^\d{1,3}(\.\d{1,3}){3}$') { return $ip }
+        }
+        catch { }
+    }
+    return $null
+}
+
+function Test-AzureCloudShell {
+    # In Cloud Shell the machine's public IP is the container's Azure egress, NOT
+    # the admin's, so it must never be auto-allowed.
+    return [bool](
+        ($env:AZUREPS_HOST_ENVIRONMENT -like 'cloud-shell*') -or
+        ($env:POWERSHELL_DISTRIBUTION_CHANNEL -eq 'CloudShell') -or
+        $env:ACC_CLOUD
+    )
+}
+
+function Show-CBSignInIpHint {
+    <#
+    .SYNOPSIS
+        Shows the addresses the operator has recently signed in from, so they can
+        recognise which one to allow.
+    .DESCRIPTION
+        Guessing a public IP is the step people get wrong, and getting it wrong
+        here locks somebody out of the thing they just installed. Entra already
+        knows the answer: it recorded the address every time this account signed
+        in.
+
+        Distinct addresses, most recent first, rather than the raw log. Five rows
+        of the same address answers nothing, and what the operator is trying to
+        work out is "which addresses do we come from", which is a set.
+
+        Best effort throughout. Sign-in logs need an Entra ID P1 or P2 licence and
+        a role that may read them, and the Azure CLI's own token may not carry the
+        scope. None of that is worth failing a deployment over, so every path ends
+        in a hint rather than an error.
+    #>
+    [CmdletBinding()] param([int]$Sample = 25)
+    Write-Host 'Looking up the addresses you have recently signed in from...'
+    try {
+        # az directly rather than Invoke-Az: install.ps1 dot-sources this file to
+        # show the hint before the deploy runs, and does not define that helper.
+        $me = (& az rest --method GET --url 'https://graph.microsoft.com/v1.0/me' --only-show-errors 2>$null) | Out-String | ConvertFrom-Json
+        $upn = "$($me.userPrincipalName)"
+        if ($upn) {
+            $filter = [Uri]::EscapeDataString("userPrincipalName eq '$($upn.Replace("'", "''"))'")
+            $url = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$top=$Sample&`$filter=$filter"
+            $resp = (& az rest --method GET --url $url --only-show-errors 2>$null) | Out-String | ConvertFrom-Json
+            $rows = @($resp.value | Where-Object { "$($_.ipAddress)" })
+            if ($rows.Count) {
+                $summary = $rows | Group-Object -Property ipAddress | ForEach-Object {
+                    [pscustomobject]@{
+                        Address   = $_.Name
+                        SignIns   = $_.Count
+                        LastSeen  = ("$(($_.Group | Sort-Object createdDateTime -Descending | Select-Object -First 1).createdDateTime)" -split 'T')[0]
+                        LastUsedFor = "$(($_.Group | Sort-Object createdDateTime -Descending | Select-Object -First 1).appDisplayName)"
+                    }
+                } | Sort-Object -Property LastSeen -Descending
+
+                Write-Host ''
+                Write-Host 'You have signed in from these addresses:' -ForegroundColor Cyan
+                ($summary | Format-Table -AutoSize | Out-String).TrimEnd() | Write-Host
+                Write-Host 'One of these is almost certainly what you want. If your employees sign in through the same' -ForegroundColor Cyan
+                Write-Host 'corporate egress, allow that range rather than a single address.' -ForegroundColor Cyan
+                Write-Host ''
+                return
+            }
+        }
+    }
+    catch { }
+    Write-Host '(Could not read your sign-in history: it needs an Entra ID P1 or P2 licence and permission to read the'
+    Write-Host ' sign-in logs. Find the address from the network your employees use, e.g. https://ifconfig.me.)'
+}
+
+function Open-CBStorageForUpload {
+    <#
+    .SYNOPSIS
+        Temporarily lets this machine reach a storage account whose firewall is
+        already locked down. Returns what to undo.
+    .DESCRIPTION
+        Re-running the deploy against an existing install hits the lockdown the
+        LAST run applied: the portal upload comes from wherever the deploy is
+        running, which is usually not one of the allowed ranges (in Cloud Shell it
+        never is). The upload then fails with "The request may be blocked by
+        network rules of storage account" and the portal is left stale.
+
+        Nothing is opened that was not closed: the rule is only added when the
+        account is actually denying by default and this address is not already
+        allowed, and Close-CBStorageForUpload puts it back exactly as it was.
+    .OUTPUTS
+        @{ Added; Ip; Account; ResourceGroup }
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Account, [Parameter(Mandatory)][string]$ResourceGroup, [string[]]$AlreadyAllowed)
+    $none = @{ Added = $false; Ip = ''; Account = $Account; ResourceGroup = $ResourceGroup }
+
+    $rules = $null
+    try { $rules = (& az storage account show --name $Account --resource-group $ResourceGroup --query networkRuleSet --only-show-errors 2>$null) | Out-String | ConvertFrom-Json }
+    catch { return $none }
+    if (-not $rules -or "$($rules.defaultAction)" -ne 'Deny') { return $none }
+
+    $ip = Get-MyPublicIp
+    if (-not $ip) {
+        Write-Warning "The $Account firewall denies by default and this machine's address could not be determined, so the upload may fail."
+        return $none
+    }
+
+    # Already allowed, by an existing rule or by what the operator asked for.
+    $existing = @($rules.ipRules | ForEach-Object { "$($_.ipAddressOrRange)" })
+    $wanted = @(@($AlreadyAllowed) | ForEach-Object { "$_" })
+    if ($existing -contains $ip -or $existing -contains "$ip/32" -or $wanted -contains $ip -or $wanted -contains "$ip/32") {
+        return $none
+    }
+
+    Write-Host "Allowing $ip through the $Account firewall for the upload..."
+    & az storage account network-rule add --account-name $Account --resource-group $ResourceGroup --ip-address $ip --only-show-errors 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not open $Account for this address; the upload may fail."
+        return $none
+    }
+    # Storage firewall changes are not instant.
+    Start-Sleep -Seconds 20
+    return @{ Added = $true; Ip = $ip; Account = $Account; ResourceGroup = $ResourceGroup }
+}
+
+function Close-CBStorageForUpload {
+    <#
+    .SYNOPSIS
+        Undoes Open-CBStorageForUpload. Does nothing when nothing was opened.
+    #>
+    [CmdletBinding()] param($Opened)
+    if (-not $Opened -or -not $Opened.Added) { return }
+    Write-Host "Removing the temporary $($Opened.Ip) rule from $($Opened.Account)..."
+    & az storage account network-rule remove --account-name $Opened.Account --resource-group $Opened.ResourceGroup `
+        --ip-address $Opened.Ip --only-show-errors 2>$null | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "The temporary rule for $($Opened.Ip) on $($Opened.Account) could not be removed. Remove it by hand: az storage account network-rule remove --account-name $($Opened.Account) --resource-group $($Opened.ResourceGroup) --ip-address $($Opened.Ip)"
+    }
+}
 
 function Get-CBRequirement {
     [CmdletBinding()] param()

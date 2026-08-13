@@ -209,7 +209,15 @@ window.CB_AUTH = {
 };
 "@
     Set-Content -Path (Join-Path $webStage 'authConfig.js') -Value $authJs -Encoding UTF8
-    Invoke-Az -AzArgs @('storage', 'blob', 'upload-batch', '--account-name', $WebStorage, '--account-key', $webKey, '--destination', '$web', '--source', $webStage, '--overwrite') | Out-Null
+
+    # The lockdown from the install is already in place, and this machine is
+    # almost certainly not inside it.
+    $opened = Open-CBStorageForUpload -Account $WebStorage -ResourceGroup $ResourceGroup
+    try {
+        Invoke-Az -AzArgs @('storage', 'blob', 'upload-batch', '--account-name', $WebStorage, '--account-key', $webKey, '--destination', '$web', '--source', $webStage, '--overwrite') | Out-Null
+    }
+    finally { Close-CBStorageForUpload -Opened $opened }
+
     Remove-Item $webStage -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host "Portal redeployed to https://$WebStorage.z6.web.core.windows.net/ (clientId $appId, api https://$hostName/api)."
 }

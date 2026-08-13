@@ -144,82 +144,6 @@ function Get-TenantIdFromDomain {
     return $null
 }
 
-function Get-MyPublicIp {
-    foreach ($svc in @('https://api.ipify.org', 'https://ifconfig.me/ip', 'https://icanhazip.com')) {
-        try {
-            $ip = "$(Invoke-RestMethod -Method Get -Uri $svc -TimeoutSec 10 -ErrorAction Stop)".Trim()
-            if ($ip -match '^\d{1,3}(\.\d{1,3}){3}$') { return $ip }
-        }
-        catch { }
-    }
-    return $null
-}
-
-function Test-AzureCloudShell {
-    # In Cloud Shell the machine's public IP is the container's Azure egress, NOT
-    # the admin's, so it must never be auto-allowed.
-    return [bool](
-        ($env:AZUREPS_HOST_ENVIRONMENT -like 'cloud-shell*') -or
-        ($env:POWERSHELL_DISTRIBUTION_CHANNEL -eq 'CloudShell') -or
-        $env:ACC_CLOUD
-    )
-}
-
-function Show-CBSignInIpHint {
-    <#
-    .SYNOPSIS
-        Shows the addresses the operator has recently signed in from, so they can
-        recognise which one to allow.
-    .DESCRIPTION
-        Guessing a public IP is the step people get wrong, and getting it wrong
-        here locks somebody out of the thing they just installed. Entra already
-        knows the answer: it recorded the address every time this account signed
-        in.
-
-        Distinct addresses, most recent first, rather than the raw log. Five rows
-        of the same address answers nothing, and what the operator is trying to
-        work out is "which addresses do we come from", which is a set.
-
-        Best effort throughout. Sign-in logs need an Entra ID P1 or P2 licence and
-        a role that may read them, and the Azure CLI's own token may not carry the
-        scope. None of that is worth failing a deployment over, so every path ends
-        in a hint rather than an error.
-    #>
-    [CmdletBinding()] param([int]$Sample = 25)
-    Write-Host 'Looking up the addresses you have recently signed in from...'
-    try {
-        $me = Invoke-Az -AzArgs @('rest', '--method', 'GET', '--url', 'https://graph.microsoft.com/v1.0/me') -AllowFail | Out-String | ConvertFrom-Json
-        $upn = "$($me.userPrincipalName)"
-        if ($upn) {
-            $filter = [Uri]::EscapeDataString("userPrincipalName eq '$($upn.Replace("'", "''"))'")
-            $url = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$top=$Sample&`$filter=$filter"
-            $resp = Invoke-Az -AzArgs @('rest', '--method', 'GET', '--url', $url) -AllowFail | Out-String | ConvertFrom-Json
-            $rows = @($resp.value | Where-Object { "$($_.ipAddress)" })
-            if ($rows.Count) {
-                $summary = $rows | Group-Object -Property ipAddress | ForEach-Object {
-                    [pscustomobject]@{
-                        Address   = $_.Name
-                        SignIns   = $_.Count
-                        LastSeen  = ("$(($_.Group | Sort-Object createdDateTime -Descending | Select-Object -First 1).createdDateTime)" -split 'T')[0]
-                        LastUsedFor = "$(($_.Group | Sort-Object createdDateTime -Descending | Select-Object -First 1).appDisplayName)"
-                    }
-                } | Sort-Object -Property LastSeen -Descending
-
-                Write-Host ''
-                Write-Host 'You have signed in from these addresses:' -ForegroundColor Cyan
-                ($summary | Format-Table -AutoSize | Out-String).TrimEnd() | Write-Host
-                Write-Host 'One of these is almost certainly what you want. If your employees sign in through the same' -ForegroundColor Cyan
-                Write-Host 'corporate egress, allow that range rather than a single address.' -ForegroundColor Cyan
-                Write-Host ''
-                return
-            }
-        }
-    }
-    catch { }
-    Write-Host '(Could not read your sign-in history: it needs an Entra ID P1 or P2 licence and permission to read the'
-    Write-Host ' sign-in logs. Find the address from the network your employees use, e.g. https://ifconfig.me.)'
-}
-
 # Single source of truth for the version: the VERSION file at the repo root.
 $moduleVersion = '0.1.0'
 try {
@@ -695,8 +619,16 @@ window.CB_AUTH = {
 };
 "@
     Set-Content -Path (Join-Path $webStage 'authConfig.js') -Value $authJs -Encoding UTF8
-    Invoke-Az -AzArgs @('storage', 'blob', 'upload-batch', '--account-name', $WebStorage, '--account-key', $webKey,
-        '--destination', '$web', '--source', $webStage, '--overwrite') | Out-Null
+
+    # A re-run hits the lockdown the last run applied, and the upload comes from
+    # wherever the deploy is running rather than from an allowed range.
+    $opened = Open-CBStorageForUpload -Account $WebStorage -ResourceGroup $ResourceGroup -AlreadyAllowed $AllowedIp
+    try {
+        Invoke-Az -AzArgs @('storage', 'blob', 'upload-batch', '--account-name', $WebStorage, '--account-key', $webKey,
+            '--destination', '$web', '--source', $webStage, '--overwrite') | Out-Null
+    }
+    finally { Close-CBStorageForUpload -Opened $opened }
+
     Remove-Item $webStage -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host 'Portal uploaded.' -ForegroundColor Green
 }

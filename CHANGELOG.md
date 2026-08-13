@@ -4,6 +4,15 @@ All notable changes to Collaborate are documented here. The version is the singl
 source in `VERSION` (stamped into the module manifest, the `CB_VERSION` app
 setting, and the portal footer at deploy time).
 
+## 0.6.1
+### Deploy: help choosing the address to allow
+
+- The deploy now lists the addresses **Entra has seen you sign in from**, grouped
+  by address with a count and when each was last used, so the allowlist is
+  recognised. Ported from M365AutoRevocate's
+  `Show-ARSignInIpHint`, over `az rest` rather than the Az PowerShell module,
+  which the deploy already requires.
+- It now also asks **outside** Cloud Shell, not only inside it.
 
 ## 0.6.0
 ### Two people can share with the same guest
@@ -66,15 +75,6 @@ setting, and the portal footer at deploy time).
   would put "active" above "blocked".
 - **Who** and **Status** carry a filter in the header
 
-### Deploy: help choosing the address to allow
-
-- The deploy now lists the addresses **Entra has seen you sign in from**, grouped
-  by address with a count and when each was last used, so the allowlist is
-  recognised. Ported from M365AutoRevocate's
-  `Show-ARSignInIpHint`, over `az rest` rather than the Az PowerShell module,
-  which the deploy already requires.
-- It now also asks **outside** Cloud Shell, not only inside it.
-- `-AllowedIp` still skips the prompt, and an unattended run never prompts.
 
 ## 0.5.0
 Woohoo!

@@ -231,7 +231,9 @@ th { font-size: 13px; color: var(--muted); font-weight: 600; }
 .preview-subject { font-weight: 600; padding: 8px 0; border-bottom: 1px solid var(--line); margin-bottom: 8px; }
 
 /* ---------- toasts ---------- */
-#toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 60; max-width: 420px; }
+/* Above the drawer and the header menus: a toast rendered underneath one of
+   them is the same as no toast at all. */
+#toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 100; max-width: 420px; }
 .toast {
   background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--brand-accent);
   border-radius: 4px; padding: 12px 14px; box-shadow: 0 4px 20px rgba(0, 0, 0, .18);

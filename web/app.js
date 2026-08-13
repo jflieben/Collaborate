@@ -1780,7 +1780,7 @@
       var it = pending[next++];
       api("/browse?pane=siteinfo&q=" + encodeURIComponent(it.webUrl))
         .then(function (data) { cache[it.webUrl] = data.siteSettings || { known: false }; })
-        .catch(function () { cache[it.webUrl] = { known: false }; })
+        .catch(function (e) { cache[it.webUrl] = { known: false, detail: e.message }; })
         .then(function () { annotateSiteRow(it); pump(); });
     }
     for (var i = 0; i < 4; i++) { pump(); }
@@ -1788,8 +1788,28 @@
 
   function annotateSiteRow(item) {
     var info = siteSettingsCache()[item.webUrl];
+    if (!info) { return; }
+
+    // Not being able to read the settings is worth saying once, above the list,
+    // rather than silently showing nothing on every row. Consent not granted is
+    // the one an administrator can fix, and it looks like every other failure
+    // unless it is named.
+    if (!info.known) {
+      if (truthy(info.needsConsent) && !state.siteInfoNoted) {
+        state.siteInfoNoted = true;
+        var top = el("shItems");
+        if (top) {
+          var note = document.createElement("p");
+          note.className = "small status bad";
+          note.textContent = info.reason || "Site sharing status is unavailable.";
+          top.insertBefore(note, top.firstChild);
+        }
+      }
+      return;
+    }
+
     var host = document.querySelector('[data-site-note="' + cssEscape(item.webUrl) + '"]');
-    if (!host || !info || !info.known) { return; }
+    if (!host) { return; }
     if (truthy(info.canShareExternally)) { return; }
     host.innerHTML = ' <span class="pill warn">no external sharing</span>';
     host.title = info.reason || "";

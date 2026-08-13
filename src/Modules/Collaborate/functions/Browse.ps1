@@ -310,7 +310,7 @@ function ConvertTo-CBSiteSettings {
     [CmdletBinding()] param($Site)
     $result = [ordered]@{
         Known = $false; CanShareExternally = $true; Locked = $false
-        Reason = ''; Classification = ''
+        Reason = ''; Classification = ''; NeedsConsent = $false; Detail = ''
     }
     if (-not $Site) { return $result }
     $result.Known = $true
@@ -353,9 +353,15 @@ function Get-CBSiteSettings {
         $detail = "$($_.Exception.Message)"
         Write-Warning "Could not read the settings of ${SiteUrl}: $detail"
         $out = ConvertTo-CBSiteSettings -Site $null
-        # A site nobody can read at all is usually locked or archived, which is
-        # worth saying rather than showing nothing.
-        if ($detail -match 'HTTP 403|HTTP 404|locked|archiv') {
+        $out.Detail = $detail
+        # Consent not granted yet is the one failure an administrator can fix,
+        # and it looks identical to every other failure unless it is named. The
+        # portal says it once rather than per site.
+        if ($detail -match 'AADSTS65001|invalid_grant|consent|HTTP 401|Unauthorized') {
+            $out.NeedsConsent = $true
+            $out.Reason = 'Collaborate is not consented to read SharePoint site settings yet. Re-run the deployment to grant the AllSites.Read permission.'
+        }
+        elseif ($detail -match 'HTTP 403|HTTP 404|locked|archiv') {
             $out.Reason = 'SharePoint would not answer for this site. It may be locked, archived, or not readable by you.'
         }
         return $out

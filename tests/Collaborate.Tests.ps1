@@ -209,6 +209,33 @@ Describe 'Functions that return a list' {
     }
 }
 
+Describe 'The installer and the deploy agree about the IP prompt' {
+    BeforeAll {
+        $installer = Get-Content (Join-Path $PSScriptRoot '..\install.ps1') -Raw
+        $common = Get-Content (Join-Path $PSScriptRoot '..\deploy\CB.Common.ps1') -Raw
+        $deploy = Get-Content (Join-Path $PSScriptRoot '..\deploy\Deploy-Collaborate.ps1') -Raw
+    }
+    It 'asks for the address in exactly one place' {
+        # The installer used to ask first and pass -AllowedIp, which is how the
+        # deploy knows the question is settled: its own prompt and its sign-in
+        # hint then never ran, and the operator answered the same question twice.
+        $installer | Should -Not -Match 'Read-Host .IP addresses'
+        $deploy | Should -Match 'Read-Host .IP addresses'
+        $deploy | Should -Match 'Show-CBSignInIpHint'
+    }
+    It 'keeps the helpers somewhere both can reach' {
+        $common | Should -Match 'function Show-CBSignInIpHint'
+        $common | Should -Match 'function Get-MyPublicIp'
+        $common | Should -Match 'function Test-AzureCloudShell'
+        $deploy | Should -Not -Match 'function Show-CBSignInIpHint'
+    }
+    It 'does not make the hint depend on the deploy script' {
+        # install.ps1 dot-sources CB.Common on its own, without Invoke-Az.
+        $hint = [regex]::Match($common, '(?s)function Show-CBSignInIpHint.*?\n}').Value
+        $hint | Should -Not -Match 'Invoke-Az\s+-AzArgs'
+    }
+}
+
 Describe 'HTTP routes' {
     BeforeAll {
         $functionRoot = Join-Path $PSScriptRoot '..\src'
