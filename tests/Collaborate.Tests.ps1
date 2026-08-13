@@ -215,6 +215,15 @@ Describe 'The installer and the deploy agree about the IP prompt' {
         $common = Get-Content (Join-Path $PSScriptRoot '..\deploy\CB.Common.ps1') -Raw
         $deploy = Get-Content (Join-Path $PSScriptRoot '..\deploy\Deploy-Collaborate.ps1') -Raw
     }
+    It 'loads the shared helpers before the first question that uses them' {
+        # The questions moved to the front and the helpers moved into CB.Common.
+        # Dot-sourcing it at the old place (next to the permission step) left the
+        # first prompt calling functions that did not exist yet.
+        $dot = $deploy.IndexOf("CB.Common.ps1")
+        $firstUse = $deploy.IndexOf('Show-CBSignInIpHint')
+        $dot | Should -BeGreaterThan -1
+        $firstUse | Should -BeGreaterThan $dot
+    }
     It 'asks for the address in exactly one place' {
         # The installer used to ask first and pass -AllowedIp, which is how the
         # deploy knows the question is settled: its own prompt and its sign-in

@@ -218,7 +218,7 @@ window.CB_AUTH = {
 
     # The lockdown from the install is already in place, and this machine is
     # almost certainly not inside it.
-    $uploaded = Invoke-CBPortalUpload -Account $WebStorage -ResourceGroup $ResourceGroup -AccountKey $webKey -Source $webStage
+    $uploaded = Invoke-CBPortalUpload -Account $WebStorage -ResourceGroup $ResourceGroup -AccountKey $webKey -Source $webStage -SubscriptionId $SubscriptionId
     Remove-Item $webStage -Recurse -Force -ErrorAction SilentlyContinue
     if ($uploaded) {
         Write-Host "Portal redeployed to https://$WebStorage.z6.web.core.windows.net/ (clientId $appId, api https://$hostName/api)."

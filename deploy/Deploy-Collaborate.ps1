@@ -152,6 +152,11 @@ try {
 }
 catch { }
 
+# Shared helpers (permission reconciliation, the portal upload, the network
+# helpers the questions below use). Dot-sourced here rather than next to the
+# permission step: the very first prompt already calls into it.
+. (Join-Path $PSScriptRoot 'CB.Common.ps1')
+
 # --- Preflight ---------------------------------------------------------------
 Write-Step 'Preflight'
 if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
@@ -213,6 +218,32 @@ if ($InviterGroupName) {
     if ($InviterGroupObjectId) { Write-Host "Inviter group : $InviterGroupName ($InviterGroupObjectId)" }
     else { Write-Warning "No group named '$InviterGroupName' was found; leaving invitations open to every internal member (you can set this in the portal)." }
 }
+
+# --- The last thing the operator has to answer -------------------------------
+# The deploy takes several minutes. Every question is asked here so somebody can
+# start it, walk away, and come back to it finished rather than to a prompt.
+$detectedIp = $null
+if (-not ($SkipNetworkLockdown -or $PublicWithSso)) {
+    if (Test-AzureCloudShell) {
+        Write-Host 'Azure Cloud Shell detected: the address here is an Azure one, not yours, so it is never used.' -ForegroundColor Yellow
+    }
+    else { $detectedIp = Get-MyPublicIp }
+
+    # Detecting an address is not the same as knowing it is the right one. This
+    # portal is used by every employee, not only by whoever ran the deploy, and
+    # locking it to the deployer's home address is a failure nobody notices until
+    # the first person complains. An unattended run keeps the detected address.
+    if (-not $AllowedIp -and [Environment]::UserInteractive) {
+        Write-Step 'Who may reach the portal'
+        if ($detectedIp) { Write-Host "Your current public address is $detectedIp." }
+        Show-CBSignInIpHint
+        Write-Host 'Employees use this portal, so allow the ranges they browse from (your corporate egress), not only your own address.'
+        $blankMeans = if ($detectedIp) { "blank = just $detectedIp" } else { 'blank = skip the lockdown for now' }
+        $entered = (Read-Host "IP addresses or CIDR ranges to allow, comma separated ($blankMeans)").Trim()
+        if ($entered) { $AllowedIp = @($entered -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    }
+}
+
 
 # --- Names -------------------------------------------------------------------
 $stableSuffix = Get-StableSuffix -Seed $tenantId
@@ -395,7 +426,6 @@ if ($rbacFailed) {
 
 # --- API permissions ---------------------------------------------------------
 Write-Step 'API permissions (managed identity)'
-. (Join-Path $PSScriptRoot 'CB.Common.ps1')
 $graphRolesFailed = @(Update-CBPermission -PrincipalId $principalId)
 if ($graphRolesFailed.Count -eq 0) { Write-Host 'API permissions reconciled: all required roles are granted.' -ForegroundColor Green }
 
@@ -636,7 +666,7 @@ window.CB_AUTH = {
     # A re-run hits the lockdown the last run applied, and the upload comes from
     # wherever the deploy is running rather than from an allowed range.
     $uploaded = Invoke-CBPortalUpload -Account $WebStorage -ResourceGroup $ResourceGroup `
-        -AccountKey $webKey -Source $webStage -AlreadyAllowed $AllowedIp
+        -AccountKey $webKey -Source $webStage -SubscriptionId $SubscriptionId
     Remove-Item $webStage -Recurse -Force -ErrorAction SilentlyContinue
     if ($uploaded) { Write-Host 'Portal uploaded.' -ForegroundColor Green }
     else { throw "The portal files could not be uploaded to $WebStorage." }
@@ -656,33 +686,6 @@ if ($SkipNetworkLockdown -or $PublicWithSso) {
 }
 else {
     Write-Step 'Network access restrictions'
-    $detectedIp = $null
-    if (Test-AzureCloudShell) {
-        Write-Host 'Azure Cloud Shell detected: the auto-detected address is an Azure one, not yours, so it will NOT be used.' -ForegroundColor Yellow
-        if (-not $AllowedIp -and [Environment]::UserInteractive) {
-            Show-CBSignInIpHint
-            Write-Host 'Employees use this portal, so allow the ranges they browse from (your corporate egress), not only your own address.'
-            $entered = (Read-Host 'IP addresses or CIDR ranges to allow, comma separated (blank = skip lockdown for now)').Trim()
-            if ($entered) { $AllowedIp = @($entered -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-        }
-    }
-    else {
-        $detectedIp = Get-MyPublicIp
-        # Detecting an address is not the same as knowing it is the right one.
-        # This portal is used by every employee, not only by whoever ran the
-        # deploy, and locking it to the deployer's home address is a failure
-        # nobody notices until the first person complains they cannot reach it.
-        # So when no range was given, show what Entra has seen and offer the
-        # choice while it is still cheap to make.
-        # Guarded on an interactive host: an unattended run must keep working, and
-        # there it falls back to the detected address exactly as it did before.
-        if (-not $AllowedIp -and [Environment]::UserInteractive) {
-            if ($detectedIp) { Write-Host "Detected your current address: $detectedIp" }
-            Show-CBSignInIpHint
-            $entered = (Read-Host "IP addresses or CIDR ranges to allow, comma separated (blank = just $detectedIp)").Trim()
-            if ($entered) { $AllowedIp = @($entered -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
-        }
-    }
     $allowedIps = @(@($AllowedIp) + @($detectedIp) | Where-Object { $_ } | Select-Object -Unique)
 
     if ($allowedIps.Count -eq 0) {

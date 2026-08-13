@@ -94,24 +94,27 @@ function Show-CBSignInIpHint {
 function Invoke-CBPortalUpload {
     <#
     .SYNOPSIS
-        Uploads the portal to a storage account whose firewall is already locked
-        down, and puts the firewall back exactly as it was.
+        Uploads the portal to the (locked-down) portal storage account, and puts
+        the firewall back as it was.
     .DESCRIPTION
-        Re-running against an existing install hits the lockdown the last run
-        applied. Two escalating steps, because the cheap one does not always
-        work:
+        Two things get in the way of a re-run, and neither is obvious from the
+        error the CLI prints:
 
-          1. Allow this machine's public address. Correct and narrow, but in
-             Cloud Shell the address the storage service sees is not always the
-             one an IP-echo service reports, and the rule can take longer than
-             the wait to take effect.
-          2. Set the account's default action to Allow for the length of the
-             upload. Deterministic whatever the source address is.
+          * the firewall the previous run applied, which the deploy is outside
+            of (in Cloud Shell it always is);
+          * shared-key data access being switched off, usually by an Azure Policy
+            rather than by anything here. az then returns the SAME "may be
+            blocked by network rules" hint, which sends everybody after the
+            firewall.
 
-        Both are undone in a finally, so a failed upload never leaves the account
-        open. This account holds the portal's static files and nothing else: no
-        data, no tokens, no secrets. The window is seconds, and it is stated in
-        the output rather than done quietly.
+        So the firewall is opened for the duration (simply, not per address: the
+        address a storage service sees from Cloud Shell is not reliably the one
+        an IP-echo service reports), and the upload is tried with the operator's
+        own identity first, falling back to the account key. When both fail, the
+        two settings that actually decide it are printed.
+
+        The account holds the portal's static files: no data, no tokens, no
+        secrets. The window is the length of one upload and it is announced.
     .OUTPUTS
         $true when the portal was uploaded.
     #>
@@ -119,126 +122,64 @@ function Invoke-CBPortalUpload {
     param(
         [Parameter(Mandatory)][string]$Account,
         [Parameter(Mandatory)][string]$ResourceGroup,
-        [Parameter(Mandatory)][string]$AccountKey,
         [Parameter(Mandatory)][string]$Source,
-        [string[]]$AlreadyAllowed
+        [string]$AccountKey,
+        [string]$SubscriptionId
     )
-    $upload = {
-        Invoke-Az -AzArgs @('storage', 'blob', 'upload-batch', '--account-name', $Account, '--account-key', $AccountKey,
-            '--destination', '$web', '--source', $Source, '--overwrite') -AllowFail
-    }
-
-    $rules = $null
-    try { $rules = (& az storage account show --name $Account --resource-group $ResourceGroup --query networkRuleSet --only-show-errors 2>$null) | Out-String | ConvertFrom-Json }
-    catch { }
-    $defaultAction = if ($rules) { "$($rules.defaultAction)" } else { '' }
-
-    if ($defaultAction -ne 'Deny') {
-        if ($null -ne (& $upload)) { return $true }
-        Write-Warning "Uploading the portal to $Account failed, and its firewall is not the reason."
-        return $false
-    }
-
-    $opened = Open-CBStorageForUpload -Account $Account -ResourceGroup $ResourceGroup -AlreadyAllowed $AlreadyAllowed -Rules $rules
-    $relaxed = $false
+    $settings = $null
     try {
-        if ($null -ne (& $upload)) { return $true }
+        $settings = (& az storage account show --name $Account --resource-group $ResourceGroup `
+                --query '{defaultAction:networkRuleSet.defaultAction,sharedKey:allowSharedKeyAccess,publicAccess:publicNetworkAccess,id:id}' `
+                --only-show-errors 2>$null) | Out-String | ConvertFrom-Json
+    }
+    catch { }
+    $wasDenying = $settings -and "$($settings.defaultAction)" -eq 'Deny'
 
-        Write-Host "The $Account firewall still refused the upload. Opening it for a few seconds instead..." -ForegroundColor Yellow
-        & az storage account update --name $Account --resource-group $ResourceGroup --default-action Allow --only-show-errors 2>$null | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Could not relax the $Account firewall; the portal was not uploaded."
-            return $false
+    # The operator's own identity needs a data-plane role; being Owner does not
+    # grant one. Idempotent, and a failure here is not fatal because the key path
+    # may still work.
+    if ($settings -and $settings.id) {
+        $me = Get-AzScalar (Invoke-Az -AzArgs @('ad', 'signed-in-user', 'show', '--query', 'id', '-o', 'tsv') -AllowFail)
+        if ($me) {
+            Invoke-Az -AzArgs @('role', 'assignment', 'create', '--assignee-object-id', $me, '--assignee-principal-type', 'User',
+                '--role', 'Storage Blob Data Contributor', '--scope', $settings.id) -AllowFail | Out-Null
         }
-        $relaxed = $true
-        Start-Sleep -Seconds 15
-        if ($null -ne (& $upload)) { return $true }
-        Write-Warning "The portal upload failed even with the $Account firewall open, so the firewall was not the cause."
+    }
+
+    if ($wasDenying) {
+        Write-Host "Opening the $Account firewall for the upload..." -ForegroundColor Yellow
+        & az storage account update --name $Account --resource-group $ResourceGroup --default-action Allow --only-show-errors 2>$null | Out-Null
+        Start-Sleep -Seconds 20
+    }
+
+    try {
+        $base = @('storage', 'blob', 'upload-batch', '--account-name', $Account, '--destination', '$web', '--source', $Source, '--overwrite')
+        # The signed-in identity first: it keeps working when shared-key access is
+        # switched off, which is the failure that looks like a firewall problem.
+        if ($null -ne (Invoke-Az -AzArgs ($base + @('--auth-mode', 'login')) -AllowFail)) { return $true }
+        Write-Host 'Uploading as you did not work; trying the account key...'
+        if ($AccountKey -and $null -ne (Invoke-Az -AzArgs ($base + @('--account-key', $AccountKey)) -AllowFail)) { return $true }
+
+        Write-Warning "The portal could not be uploaded to $Account."
+        if ($settings) {
+            Write-Warning "  allowSharedKeyAccess = $($settings.sharedKey), publicNetworkAccess = $($settings.publicAccess)"
+            if ("$($settings.sharedKey)" -eq 'False') {
+                Write-Warning '  Shared-key access is switched off (often by an Azure Policy), so the key cannot be used. Uploading as you needs Storage Blob Data Contributor on that account; it was just requested and can take a few minutes to take effect. Re-run then.'
+            }
+            if ("$($settings.publicAccess)" -eq 'Disabled') {
+                Write-Warning '  Public network access is Disabled on the account, so nothing outside a private endpoint can reach it, firewall rules included.'
+            }
+        }
         return $false
     }
     finally {
-        if ($relaxed) {
+        if ($wasDenying) {
             Write-Host "Closing the $Account firewall again..." -ForegroundColor Yellow
             & az storage account update --name $Account --resource-group $ResourceGroup --default-action Deny --bypass AzureServices --only-show-errors 2>$null | Out-Null
             if ($LASTEXITCODE -ne 0) {
                 Write-Warning "The $Account firewall is STILL OPEN. Close it now: az storage account update --name $Account --resource-group $ResourceGroup --default-action Deny --bypass AzureServices"
             }
         }
-        Close-CBStorageForUpload -Opened $opened
-    }
-}
-
-function Open-CBStorageForUpload {
-    <#
-    .SYNOPSIS
-        Temporarily lets this machine reach a storage account whose firewall is
-        already locked down. Returns what to undo.
-    .DESCRIPTION
-        Re-running the deploy against an existing install hits the lockdown the
-        LAST run applied: the portal upload comes from wherever the deploy is
-        running, which is usually not one of the allowed ranges (in Cloud Shell it
-        never is). The upload then fails with "The request may be blocked by
-        network rules of storage account" and the portal is left stale.
-
-        Nothing is opened that was not closed: the rule is only added when the
-        account is actually denying by default and this address is not already
-        allowed, and Close-CBStorageForUpload puts it back exactly as it was.
-    .OUTPUTS
-        @{ Added; Ip; Account; ResourceGroup }
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$Account,
-        [Parameter(Mandatory)][string]$ResourceGroup,
-        [string[]]$AlreadyAllowed,
-        # Already read by the caller, to avoid asking twice.
-        $Rules
-    )
-    $none = @{ Added = $false; Ip = ''; Account = $Account; ResourceGroup = $ResourceGroup }
-
-    $rules = $Rules
-    if (-not $rules) {
-        try { $rules = (& az storage account show --name $Account --resource-group $ResourceGroup --query networkRuleSet --only-show-errors 2>$null) | Out-String | ConvertFrom-Json }
-        catch { return $none }
-    }
-    if (-not $rules -or "$($rules.defaultAction)" -ne 'Deny') { return $none }
-
-    $ip = Get-MyPublicIp
-    if (-not $ip) {
-        Write-Warning "The $Account firewall denies by default and this machine's address could not be determined, so the upload may fail."
-        return $none
-    }
-
-    # Already allowed, by an existing rule or by what the operator asked for.
-    $existing = @($rules.ipRules | ForEach-Object { "$($_.ipAddressOrRange)" })
-    $wanted = @(@($AlreadyAllowed) | ForEach-Object { "$_" })
-    if ($existing -contains $ip -or $existing -contains "$ip/32" -or $wanted -contains $ip -or $wanted -contains "$ip/32") {
-        return $none
-    }
-
-    Write-Host "Allowing $ip through the $Account firewall for the upload..."
-    & az storage account network-rule add --account-name $Account --resource-group $ResourceGroup --ip-address $ip --only-show-errors 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Could not open $Account for this address; the upload may fail."
-        return $none
-    }
-    # Storage firewall changes are not instant.
-    Start-Sleep -Seconds 20
-    return @{ Added = $true; Ip = $ip; Account = $Account; ResourceGroup = $ResourceGroup }
-}
-
-function Close-CBStorageForUpload {
-    <#
-    .SYNOPSIS
-        Undoes Open-CBStorageForUpload. Does nothing when nothing was opened.
-    #>
-    [CmdletBinding()] param($Opened)
-    if (-not $Opened -or -not $Opened.Added) { return }
-    Write-Host "Removing the temporary $($Opened.Ip) rule from $($Opened.Account)..."
-    & az storage account network-rule remove --account-name $Opened.Account --resource-group $Opened.ResourceGroup `
-        --ip-address $Opened.Ip --only-show-errors 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "The temporary rule for $($Opened.Ip) on $($Opened.Account) could not be removed. Remove it by hand: az storage account network-rule remove --account-name $($Opened.Account) --resource-group $($Opened.ResourceGroup) --ip-address $($Opened.Ip)"
     }
 }
 

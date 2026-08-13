@@ -4,7 +4,20 @@ All notable changes to Collaborate are documented here. The version is the singl
 source in `VERSION` (stamped into the module manifest, the `CB_VERSION` app
 setting, and the portal footer at deploy time).
 
-## 0.6.3
+## 0.6.4
+### Every question is asked before the work starts
+
+- The deploy takes minutes, all typed input now happens in the first half minute
+
+### The portal upload was not a firewall problem
+
+- 
+  **shared-key access being switched off** (commonly by an Azure Policy)
+- The upload now runs **as the operator** (`--auth-mode login`) first, falling
+  back to the account key. The deploy grants itself Storage Blob Data Contributor
+  on that account.
+- When both fail it prints `allowSharedKeyAccess` and `publicNetworkAccess`
+
 ### Re-running no longer warns about things that are fine
 
 - **The admin group assignment** is checked before it is attempted. Re-posting an
