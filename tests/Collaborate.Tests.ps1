@@ -1394,11 +1394,12 @@ Describe 'Delegated scopes' {
         # deploy and the update reconcile against, so the runtime list must match
         # it exactly rather than approximately.
         $permissions = Get-Content (Join-Path $PSScriptRoot '..\deploy\permissions.json') -Raw | ConvertFrom-Json
-        # Scopes marked usedBy 'browser' are consented on the app registration
-        # but requested by the SPA with the user's own token, never by the
-        # on-behalf-of flow. Asking for one here would send that mail from a
-        # datacentre IP, which is the thing the split exists to avoid.
-        $declared = @($permissions.delegatedScopes | Where-Object { "$($_.usedBy)" -ne 'browser' } | ForEach-Object { $_.value }) | Sort-Object
+        # Scopes carrying a usedBy are consented on the app registration but not
+        # asked for by the on-behalf-of flow's default scope set: 'browser' is
+        # requested by the SPA with the user's own token, and 'sharepoint' is a
+        # different resource, so it is asked for separately and cannot appear in
+        # a Graph scope list at all.
+        $declared = @($permissions.delegatedScopes | Where-Object { -not "$($_.usedBy)" } | ForEach-Object { $_.value }) | Sort-Object
         $requested = @(Get-CBOboScope | ForEach-Object { ($_ -split '/')[-1] }) | Sort-Object
         ($requested -join ',') | Should -Be ($declared -join ',')
     }
@@ -1523,35 +1524,183 @@ Describe 'Format-CBRelativeDate and Get-CBItemWhenLabel' {
 Describe 'Get-CBSharedItemView' {
     BeforeAll {
         $now = [datetime]::new(2026, 8, 12, 12, 0, 0, [DateTimeKind]::Utc)
+        $alex = 'alex@contoso.com'
+        $sam = 'sam@contoso.com'
         $json = @'
-[{"kind":"file","name":"Q3 Proposal.docx","webUrl":"https://contoso.sharepoint.com/q3.docx","role":"write","sharedBy":"alex@contoso.com","sharedAtUtc":"2026-08-11T09:00:00Z"},
- {"kind":"team","name":"Project Falcon","webUrl":"https://teams.microsoft.com/l/team/1","role":"","sharedBy":"alex@contoso.com","sharedAtUtc":"2026-07-01T09:00:00Z"}]
+[{"id":"a1","kind":"file","name":"Q3 Proposal.docx","webUrl":"https://contoso.sharepoint.com/q3.docx","role":"write","sharedBy":"alex@contoso.com","driveId":"b!d","itemId":"01ITEM","sharedAtUtc":"2026-08-11T09:00:00Z"},
+ {"id":"a2","kind":"team","name":"Project Falcon","webUrl":"https://teams.microsoft.com/l/team/1","role":"","sharedBy":"sam@contoso.com","groupId":"g1","sharedAtUtc":"2026-07-01T09:00:00Z"},
+ {"id":"a3","kind":"file","name":"Redundancy plan.xlsx","webUrl":"https://contoso.sharepoint.com/redundancy.xlsx","role":"read","sharedBy":"sam@contoso.com","driveId":"b!d","itemId":"02ITEM","sharedAtUtc":"2026-08-10T09:00:00Z"}]
 '@
     }
-    It 'says what each thing is and what they can do with it' {
-        $items = Get-CBSharedItemView -Json $json -Now $now
-        $items.Count | Should -Be 2
-        $items[0].kindLabel | Should -Be 'File'
-        $items[0].roleLabel | Should -Be 'Can edit'
-        $items[0].sharedAtLabel | Should -Be 'yesterday'
-        $items[1].kindLabel | Should -Be 'Team'
-        $items[1].roleLabel | Should -Be 'Member'
+    It 'names and links what the viewer shared' {
+        $mine = @(Get-CBSharedItemView -Json $json -Now $now -ViewerUpn $alex)[0]
+        $mine.name | Should -Be 'Q3 Proposal.docx'
+        $mine.roleLabel | Should -Be 'Can edit'
+        $mine.webUrl | Should -Be 'https://contoso.sharepoint.com/q3.docx'
+        $mine.sharedByYou | Should -BeTrue
+        $mine.canRevoke | Should -BeTrue
+        $mine.sharedAtLabel | Should -Be 'yesterday'
+    }
+    It 'does not name a document somebody else shared, and does not link it either' {
+        # Two colleagues sharing with the same guest is a normal thing to want.
+        # It does not make the other one's file names the viewer's business, and
+        # "Redundancy plan.xlsx" is the example that makes the point: the name is
+        # the disclosure. The URL carries the name too, so it goes with it.
+        $theirs = @(Get-CBSharedItemView -Json $json -Now $now -ViewerUpn $alex)[2]
+        $theirs.redacted | Should -BeTrue
+        $theirs.name | Should -Not -Match 'Redundancy'
+        $theirs.webUrl | Should -Be ''
+        $theirs.roleLabel | Should -Be ''
+        $theirs.sharedBy | Should -Be $sam
+        $theirs.canRevoke | Should -BeFalse
+    }
+    It 'always names a Team, whoever added them' {
+        # A Team is a named group of people, its membership is visible to its
+        # members anyway, and knowing somebody is in "Project Falcon" is not the
+        # same class of disclosure as a file name.
+        $team = @(Get-CBSharedItemView -Json $json -Now $now -ViewerUpn $alex)[1]
+        $team.name | Should -Be 'Project Falcon'
+        $team.redacted | Should -BeFalse
+    }
+    It 'lets an administrator read every name but revoke none of them' {
+        # Reviewing what an external party can reach is the job. Revoking runs as
+        # the person who granted it, and doing it on their behalf would mean the
+        # managed identity holding write access to every file in the tenant.
+        $seen = @(Get-CBSharedItemView -Json $json -Now $now -ViewerUpn 'admin@contoso.com' -ViewerIsAdmin)
+        $seen[2].name | Should -Be 'Redundancy plan.xlsx'
+        $seen[2].redacted | Should -BeFalse
+        @($seen | Where-Object { $_.canRevoke }).Count | Should -Be 0
+        $seen[2].revokeBlockedReason | Should -Match 'Only sam@contoso.com'
+    }
+    It 'names nothing at all when nobody in particular is looking' {
+        @(Get-CBSharedItemView -Json $json -Now $now)[0].redacted | Should -BeTrue
+    }
+    It 'cannot revoke a record written before the ids were kept' {
+        # Listed, but not undoable: the entry says which file only in words.
+        $old = '[{"id":"x","kind":"file","name":"old.docx","role":"read","sharedBy":"alex@contoso.com"}]'
+        $item = @(Get-CBSharedItemView -Json $old -Now $now -ViewerUpn $alex)[0]
+        $item.canRevoke | Should -BeFalse
+        $item.revokeBlockedReason | Should -Match 'before Collaborate recorded'
     }
     It 'only turns an https address into a link' {
         # These come from Graph rather than from a person, but a URL is one of
         # the two places markup turns into behaviour.
-        $odd = '[{"kind":"file","name":"x","webUrl":"javascript:alert(1)","role":"read"}]'
+        $odd = '[{"kind":"file","name":"x","webUrl":"javascript:alert(1)","role":"read","sharedBy":"alex@contoso.com"}]'
         # Wrapped in @(): a single-item return unrolls, which is the convention
         # documented in Sanitise.ps1 and the reason callers always wrap.
-        @(Get-CBSharedItemView -Json $odd -Now $now)[0].webUrl | Should -Be ''
+        @(Get-CBSharedItemView -Json $odd -Now $now -ViewerUpn $alex)[0].webUrl | Should -Be ''
     }
     It 'survives a row written by an older version, or no row at all' {
         Get-CBSharedItemView -Json '' -Now $now | Should -HaveCount 0
         Get-CBSharedItemView -Json 'not json' -Now $now | Should -HaveCount 0
-        @(Get-CBSharedItemView -Json '[{"name":"only a name"}]' -Now $now)[0].kindLabel | Should -Be 'File'
+        @(Get-CBSharedItemView -Json '[{"name":"only a name"}]' -Now $now -ViewerIsAdmin)[0].kindLabel | Should -Be 'File'
     }
     It 'drops an entry with nothing to show' {
         Get-CBSharedItemView -Json '[{"kind":"file"},null]' -Now $now | Should -HaveCount 0
+    }
+}
+
+Describe 'ConvertTo-CBSiteSettings' {
+    It 'reads a site that allows external sharing' {
+        $s = ConvertTo-CBSiteSettings -Site ([pscustomobject]@{
+                ReadOnly = $false; WriteLocked = $false; ShareByEmailEnabled = $true; Classification = 'Internal'
+            })
+        $s.Known | Should -BeTrue
+        $s.CanShareExternally | Should -BeTrue
+        $s.Locked | Should -BeFalse
+        $s.Classification | Should -Be 'Internal'
+    }
+    It 'reads a site that does not' {
+        $s = ConvertTo-CBSiteSettings -Site ([pscustomobject]@{ ShareByEmailEnabled = $false })
+        $s.CanShareExternally | Should -BeFalse
+        $s.Reason | Should -Match 'outside the company'
+    }
+    It 'treats a locked or read-only site as unshareable, and says which' {
+        (ConvertTo-CBSiteSettings -Site ([pscustomobject]@{ ReadOnly = $true })).Locked | Should -BeTrue
+        $s = ConvertTo-CBSiteSettings -Site ([pscustomobject]@{ WriteLocked = $true; ShareByEmailEnabled = $true })
+        $s.CanShareExternally | Should -BeFalse
+        $s.Reason | Should -Match 'read-only or locked'
+    }
+    It 'does not invent an answer when SharePoint did not give one' {
+        # A missing property means the API did not say, not that it is false.
+        # Guessing "blocked" here would hide sites that are perfectly shareable.
+        $s = ConvertTo-CBSiteSettings -Site ([pscustomobject]@{ Url = 'https://contoso.sharepoint.com/sites/x' })
+        $s.Known | Should -BeTrue
+        $s.CanShareExternally | Should -BeTrue
+    }
+    It 'is unknown when the site could not be read at all' {
+        $s = ConvertTo-CBSiteSettings -Site $null
+        $s.Known | Should -BeFalse
+        $s.CanShareExternally | Should -BeTrue -Because 'unknown must never disable a working site'
+    }
+}
+
+Describe 'Test-CBTenantAllowsSharingWith' {
+    BeforeAll {
+        $off = @{ Known = $true; AllowsExternal = $false; Restriction = 'none'; AllowedDomains = @(); BlockedDomains = @() }
+        $allowList = @{ Known = $true; AllowsExternal = $true; Restriction = 'AllowList'; AllowedDomains = @('partner.com', 'Trusted.NL'); BlockedDomains = @() }
+        $blockList = @{ Known = $true; AllowsExternal = $true; Restriction = 'BlockList'; AllowedDomains = @(); BlockedDomains = @('spam.example') }
+        $unknown = @{ Known = $false; AllowsExternal = $true }
+    }
+    It 'refuses when the tenant has external sharing switched off' {
+        (Test-CBTenantAllowsSharingWith -Email 'jane@partner.com' -Policy $off).Allowed | Should -BeFalse
+    }
+    It 'honours an allow list, case insensitively' {
+        (Test-CBTenantAllowsSharingWith -Email 'jane@PARTNER.com' -Policy $allowList).Allowed | Should -BeTrue
+        (Test-CBTenantAllowsSharingWith -Email 'jane@trusted.nl' -Policy $allowList).Allowed | Should -BeTrue
+        $refused = Test-CBTenantAllowsSharingWith -Email 'jane@other.com' -Policy $allowList
+        $refused.Allowed | Should -BeFalse
+        $refused.Reason | Should -Match 'other.com'
+    }
+    It 'honours a block list' {
+        (Test-CBTenantAllowsSharingWith -Email 'x@spam.example' -Policy $blockList).Allowed | Should -BeFalse
+        (Test-CBTenantAllowsSharingWith -Email 'x@fine.com' -Policy $blockList).Allowed | Should -BeTrue
+    }
+    It 'allows everything when the policy could not be read' {
+        # A permission not yet granted must not disable a working feature.
+        (Test-CBTenantAllowsSharingWith -Email 'x@anywhere.com' -Policy $unknown).Allowed | Should -BeTrue
+        (Test-CBTenantAllowsSharingWith -Email 'x@anywhere.com' -Policy $null).Allowed | Should -BeTrue
+    }
+    It 'does not refuse an existing guest for a missing address' {
+        # Sharing with a guest who already exists passes no address here.
+        (Test-CBTenantAllowsSharingWith -Email '' -Policy $allowList).Allowed | Should -BeTrue
+    }
+}
+
+Describe 'Get-CBGraphErrorCode' {
+    It 'reads the code out of a raw payload' {
+        Get-CBGraphErrorCode -ErrorRecord 'blah {"error":{"code":"itemNotFound"}}' | Should -Be 'itemNotFound'
+    }
+    It 'reads the code out of the readable form New-CBGraphError produces' {
+        # The message no longer carries the raw JSON, so without this the code
+        # was silently lost and every caller branching on it saw an empty string.
+        Get-CBGraphErrorCode -ErrorRecord 'Graph Get returned HTTP 404: Not found (code itemNotFound, request id abc-123)' |
+            Should -Be 'itemNotFound'
+    }
+    It 'returns empty when there is no code to find' {
+        Get-CBGraphErrorCode -ErrorRecord 'connection reset' | Should -Be ''
+    }
+}
+
+Describe 'Test-CBPermissionGrantsTo' {
+    It 'matches the guest however Graph chose to describe them' {
+        # grantedToV2 for one grantee, grantedToIdentitiesV2 for several, and the
+        # older shapes on some drives. Missing any of them would leave a
+        # permission in place while telling somebody it had gone.
+        $byId = [pscustomobject]@{ grantedToV2 = [pscustomobject]@{ user = [pscustomobject]@{ id = 'guest-1' } } }
+        $byMail = [pscustomobject]@{ grantedToIdentitiesV2 = @([pscustomobject]@{ user = [pscustomobject]@{ email = 'jane@partner.com' } }) }
+        $legacy = [pscustomobject]@{ grantedTo = [pscustomobject]@{ user = [pscustomobject]@{ id = 'guest-1' } } }
+        Test-CBPermissionGrantsTo -Permission $byId -GuestId 'guest-1' -Email 'jane@partner.com' | Should -BeTrue
+        Test-CBPermissionGrantsTo -Permission $byMail -GuestId 'guest-1' -Email 'jane@partner.com' | Should -BeTrue
+        Test-CBPermissionGrantsTo -Permission $legacy -GuestId 'guest-1' -Email 'jane@partner.com' | Should -BeTrue
+    }
+    It 'does not match somebody else' {
+        $other = [pscustomobject]@{ grantedToV2 = [pscustomobject]@{ user = [pscustomobject]@{ id = 'guest-2'; email = 'bob@partner.com' } } }
+        Test-CBPermissionGrantsTo -Permission $other -GuestId 'guest-1' -Email 'jane@partner.com' | Should -BeFalse
+    }
+    It 'ignores a permission with no user on it at all' {
+        Test-CBPermissionGrantsTo -Permission ([pscustomobject]@{ link = [pscustomobject]@{ scope = 'anonymous' } }) -GuestId 'g' -Email 'e@x.com' |
+            Should -BeFalse
     }
 }
 
@@ -1675,6 +1824,22 @@ Describe 'Get-CBShareFailureMessage' {
     It 'explains a site with external sharing switched off' {
         Get-CBShareFailureMessage -Message 'externalSharing is disabled' -ItemName 'Budget.xlsx' -Recipient 'j@p.com' |
             Should -Match 'External sharing is switched off'
+    }
+    It 'recognises that block however SharePoint phrases it' {
+        # The same block reads differently depending on whether it sits on the
+        # tenant, the site or the recipient's domain. Without all of them the
+        # generic accessDenied branch answers instead, and the person is told to
+        # ask for permission they already have.
+        $phrasings = @(
+            'Graph POST returned HTTP 403: Access denied. (code sharingDisabled)',
+            'Graph POST returned HTTP 403: The sharing operation is blocked by your organization policy',
+            'Graph POST returned HTTP 400: External sharing is not enabled for this site',
+            'Graph POST returned HTTP 403: invitationSendingDisabled'
+        )
+        foreach ($p in $phrasings) {
+            Get-CBShareFailureMessage -Message $p -ItemName 'Q3.docx' -Recipient 'jane@partner.com' |
+                Should -Match 'External sharing is switched off' -Because "of: $p"
+        }
     }
     It 'explains a plain permission refusal without leaking Graph jargon' {
         $m = Get-CBShareFailureMessage -Message 'Graph POST returned HTTP 403: accessDenied' -ItemName 'Budget.xlsx' -Recipient 'j@p.com'

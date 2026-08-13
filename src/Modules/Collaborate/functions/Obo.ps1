@@ -32,6 +32,64 @@ $script:CBOboScopes = @(
 
 function Get-CBOboScope { return $script:CBOboScopes }
 
+function Get-CBSharePointScope {
+    <#
+    .SYNOPSIS
+        The delegated SharePoint scope, which is tenant-specific and therefore
+        cannot be a constant like the Graph ones.
+    .DESCRIPTION
+        SharePoint is a different resource from Graph, so it needs its own token:
+        'https://contoso.sharepoint.com/AllSites.Read'. The host comes from
+        /sites/root, so the tenant name is never configured by hand.
+    #>
+    [CmdletBinding()] param()
+    $spHost = @(Get-CBSharePointHosts)[0]
+    if (-not $spHost) { throw 'Could not determine the SharePoint host.' }
+    return "https://$spHost/AllSites.Read"
+}
+
+function Invoke-CBSharePointRest {
+    <#
+    .SYNOPSIS
+        Calls a site's own SharePoint REST API as the signed-in user.
+    .DESCRIPTION
+        Graph does not expose a site's sharing, lock or archive state. SharePoint
+        does, on the site itself, and a user who can open the site can read it.
+        This is the same delegated principle as everything else here: the answer
+        is whatever SharePoint tells that person.
+
+        Read-only by design. The scope granted is AllSites.Read, so nothing here
+        can change anything even if it tried.
+    .PARAMETER SiteUrl
+        Absolute site URL, e.g. https://contoso.sharepoint.com/sites/marketing.
+    .PARAMETER Path
+        Appended to the site's _api root, e.g. 'site?$select=Id,ReadOnly'.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$SiteUrl, [Parameter(Mandatory)][string]$Path)
+    if (-not $Caller -or -not $Caller.Token) { throw 'No signed-in user context; refusing to act.' }
+
+    $uri = [Uri]$SiteUrl
+    $allowed = @(Get-CBSharePointHosts)
+    if ($allowed -notcontains $uri.Host) {
+        throw "Refusing to call $($uri.Host): it is not one of this tenant's SharePoint hosts."
+    }
+
+    $token = Get-CBOboToken -UserToken $Caller.Token -Oid $Caller.Oid -Scopes @(Get-CBSharePointScope)
+    $url = '{0}://{1}{2}/_api/{3}' -f $uri.Scheme, $uri.Host, $uri.AbsolutePath.TrimEnd('/'), $Path.TrimStart('/')
+
+    $response = Invoke-RestMethod -Method Get -Uri $url -Headers @{
+        Authorization = "Bearer $token"
+        Accept        = 'application/json;odata=nometadata'
+    } -SkipHttpErrorCheck -StatusCodeVariable sc -ErrorAction Stop
+
+    if ($sc -ge 400) {
+        $message = if ($response.error -and $response.error.message) { "$($response.error.message.value)" } else { "$response" }
+        throw "SharePoint returned HTTP ${sc} for $Path`: $message"
+    }
+    return $response
+}
+
 function Get-CBClientAssertion {
     <#
     .SYNOPSIS

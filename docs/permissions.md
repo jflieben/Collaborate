@@ -18,6 +18,7 @@ locked-down tenant.
 | `User.DeleteRestore.All` | Delete once the grace period lapses; restore a guest renewed in time |
 | `Directory.Read.All` | Resolve the inviter group, verified domains, guest search, the owner people picker |
 | `AuditLog.Read.All` | `signInActivity` for the last-active column and inactive-guest cleanup, and invitation events when adopting guests that predate the tool |
+| `SharePointTenantSettings.Read.All` | Read-only: the tenant's external sharing capability and allowed/blocked domain lists, so a share that cannot work is refused before a guest is created |
 
 **Directory role: Guest Inviter.** `User.Invite.All` alone is not enough in a
 tenant that restricts guest invitations to administrative roles. The deploy assigns the role to the managed
@@ -38,6 +39,12 @@ Used through the on-behalf-of flow, from the Function App:
 | `TeamMember.ReadWrite.All` | Add a guest to a Team they own, as them |
 | `GroupMember.ReadWrite.All` | The group membership behind that Team add |
 | `Team.ReadBasic.All` | Read a Team's web address, so the guest gets a link straight into the Team. |
+
+And one on **SharePoint** rather than Graph, because Graph does not show this:
+
+| Permission | Resource | Why |
+|---|---|---|
+| `AllSites.Read` | Office 365 SharePoint Online | Read a site's own settings (external sharing, lock state) as the signed-in user, so the picker can say a site will refuse before anything is chosen. Read-only. |
 
 Used **only in the browser**, by the portal itself:
 

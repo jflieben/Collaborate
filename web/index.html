@@ -95,20 +95,12 @@
           <label class="row small admin-only" hidden><input id="guestsAll" type="checkbox" /> Show every external account, not just mine</label>
         </div>
 
+        <!-- Filtering by who and by status lives in the column headers, where
+             anybody who has used a spreadsheet will look for it. This row is
+             what is left: an axis with no column of its own. -->
         <div class="row" id="guestsFilters" hidden>
-          <label class="small">Status
-            <select id="guestsState">
-              <option value="">any</option>
-              <option value="pending">waiting to accept</option>
-              <option value="active">active</option>
-              <option value="expiring">ending soon</option>
-              <option value="expired">ended</option>
-              <option value="blocked">switched off</option>
-              <option value="deleted">removed</option>
-            </select>
-          </label>
           <label class="row small"><input id="guestsUnowned" type="checkbox" /> only those nobody owns</label>
-          <input id="guestsFilter" type="text" placeholder="filter by name, address or domain" style="flex:1;min-width:200px" />
+          <span id="guestsActiveFilters" class="small muted"></span>
         </div>
 
         <div class="banner" id="guestsBulk" hidden>
@@ -214,6 +206,7 @@
           <button id="shGo" class="btn primary">Share</button>
           <span id="shStatus" class="status" role="status"></span>
         </div>
+        <div id="shError" hidden></div>
       </div>
 
       <p class="row">

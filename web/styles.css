@@ -92,7 +92,9 @@ p { margin: 0 0 12px; }
   box-shadow: var(--shadow); transition: transform .12s ease, box-shadow .12s ease;
 }
 .choice:hover, .choice:focus-visible { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0, 0, 0, .14); }
-.choice .icon { font-size: 30px; line-height: 1; }
+.choice .icon { display: block; line-height: 0; color: var(--brand-ink); }
+.choice .icon svg { width: 34px; height: 34px; display: block; }
+.choice[disabled] .icon { color: var(--muted); }
 .choice .label { font-size: 18px; font-weight: 600; }
 .choice .hint { color: var(--muted); font-size: 14px; }
 .choice[disabled] { opacity: .55; cursor: not-allowed; transform: none; box-shadow: var(--shadow); }
@@ -306,3 +308,40 @@ th { font-size: 13px; color: var(--muted); font-weight: 600; }
    stated as a sentence rather than offered as a button that cannot be pressed. */
 .actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .actions-blocked { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+
+/* ---------- sortable, filterable column headers ---------- */
+/* Sorting and filtering where a spreadsheet puts them, because that is where
+   people look for them. Both are buttons, so the keyboard reaches them. */
+th .th-sort {
+  border: none; background: none; font: inherit; font-size: 13px; font-weight: 600;
+  color: var(--muted); padding: 0; cursor: pointer; display: inline-flex; gap: 4px; align-items: center;
+}
+th .th-sort:hover { color: var(--text); }
+.sort-mark { opacity: .35; font-size: 11px; }
+.sort-mark.on { opacity: 1; color: var(--brand-ink); }
+th .th-filter {
+  border: none; background: none; font: inherit; color: var(--muted);
+  padding: 0 4px; margin-left: 2px; cursor: pointer; border-radius: 3px; line-height: 1;
+}
+th .th-filter:hover { color: var(--text); background: var(--bg); }
+th .th-filter.on { color: var(--brand-ink); font-weight: 700; }
+
+.th-menu {
+  position: absolute; z-index: 80; min-width: 240px; max-height: 60vh; overflow-y: auto;
+  background: var(--surface); border: 1px solid var(--line); border-radius: 6px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .18); padding: 12px;
+}
+.th-menu .field { margin-bottom: 10px; }
+.th-menu .checkline { margin-bottom: 6px; }
+
+/* ---------- expandable technical detail ---------- */
+/* The sentence is for the person in front of the screen; this is what they can
+   copy into a support ticket. */
+.tech { margin: 8px 0 0; font-size: 13px; }
+.tech summary { cursor: pointer; color: var(--muted); }
+.tech summary:hover { color: var(--text); }
+.tech pre {
+  white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
+  padding: 10px; font-size: 12px; max-height: 220px; overflow-y: auto;
+}

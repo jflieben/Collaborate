@@ -61,7 +61,13 @@ function Get-CBShareFailureMessage {
     #>
     [CmdletBinding()] param([string]$Message, [string]$ItemName, [string]$Recipient)
     $text = "$Message"
-    if ($text -match 'externalSharing|sharingDisabled|not enabled for external|blocked by policy|accessDenied.*external') {
+    # SharePoint says this several different ways depending on whether the block
+    # is on the tenant, the site, or the recipient's domain.
+    # "One or more users could not be resolved" is what SharePoint returns when a
+    # site refuses external people: the address is fine, the site will not have
+    # them. Read as an invalid recipient it sends somebody off to check an email
+    # address that was never the problem.
+    if ($text -match 'externalSharing|sharingDisabled|SharingDenied|invitationSendingDisabled|not enabled for external|external sharing|could not be resolved|blocked by (your |the )?(organization|organisation|tenant|site|policy)|accessDenied.*external') {
         return "External sharing is switched off for the site '$ItemName' lives in, so it cannot be shared outside the company. The person who owns that site can change it."
     }
     if ($text -match 'invalidRequest.*recipient|invalidRecipient|not a valid recipient') {
@@ -78,6 +84,91 @@ function Get-CBShareFailureMessage {
     }
     $trimmed = if ($text.Length -gt 300) { $text.Substring(0, 300) } else { $text }
     return "SharePoint refused the share: $trimmed"
+}
+
+$script:CBTenantSharing = $null
+
+function Get-CBTenantSharingPolicy {
+    <#
+    .SYNOPSIS
+        The tenant's external sharing capability and domain lists.
+    .DESCRIPTION
+        Read with the managed identity from /admin/sharepoint/settings, cached for
+        the life of the worker.
+
+        TENANT LEVEL ONLY. SharePoint's per-site setting is not exposed through
+        Graph, so a site that blocks external sharing inside a tenant that allows
+        it still only reveals itself when a share is attempted.
+
+        Unreadable (permission not granted yet, or Graph having a bad minute) is
+        NOT treated as "blocked": the answer is 'unknown' and every caller
+        carries on as before.
+    .OUTPUTS
+        @{ Known; Capability; AllowsExternal; Restriction; AllowedDomains; BlockedDomains; Reason }
+    #>
+    [CmdletBinding()] param([switch]$Refresh)
+    if ($script:CBTenantSharing -and -not $Refresh) { return $script:CBTenantSharing }
+
+    $result = @{
+        Known = $false; Capability = ''; AllowsExternal = $true; Restriction = 'none'
+        AllowedDomains = @(); BlockedDomains = @(); Reason = ''
+    }
+    try {
+        $s = Invoke-CBGraph -Uri '/admin/sharepoint/settings'
+        $capability = "$($s.sharingCapability)"
+        $result.Known = [bool]$capability
+        $result.Capability = $capability
+        # 'disabled' is the only value that stops external sharing outright.
+        # existingExternalUserSharingOnly still allows an existing guest, which is
+        # a case this tool handles, so it is not treated as a block.
+        $result.AllowsExternal = ($capability -ne 'disabled')
+        $result.Restriction = "$($s.sharingDomainRestrictionMode)"
+        $result.AllowedDomains = @($s.sharingAllowedDomainList)
+        $result.BlockedDomains = @($s.sharingBlockedDomainList)
+    }
+    catch {
+        $result.Reason = "$($_.Exception.Message)"
+        Write-Warning "Could not read the tenant's SharePoint sharing settings: $($result.Reason). Sharing will behave as before and fail at the point of use if it is blocked."
+    }
+    $script:CBTenantSharing = $result
+    return $result
+}
+
+function Test-CBTenantAllowsSharingWith {
+    <#
+    .SYNOPSIS
+        Would the tenant's own SharePoint rules refuse this address outright?
+    .DESCRIPTION
+        Pure, so the domain-list logic is testable. Only says no when the answer
+        is known: an unreadable policy means carry on.
+    .OUTPUTS
+        @{ Allowed; Reason }
+    #>
+    [CmdletBinding()] param([AllowNull()][string]$Email, $Policy)
+    if (-not $Policy -or -not $Policy.Known) { return @{ Allowed = $true; Reason = '' } }
+    if (-not $Policy.AllowsExternal) {
+        return @{ Allowed = $false
+            Reason = 'External sharing is switched off for the whole tenant in SharePoint, so nothing can be shared outside the company. A SharePoint administrator sets this.'
+        }
+    }
+    $domain = ("$Email" -split '@')[-1]
+    if (-not $domain) { return @{ Allowed = $true; Reason = '' } }
+    $domain = $domain.Trim().ToLowerInvariant()
+
+    $mode = "$($Policy.Restriction)".ToLowerInvariant()
+    if ($mode -eq 'allowlist') {
+        $allowed = @($Policy.AllowedDomains | ForEach-Object { "$_".Trim().ToLowerInvariant() } | Where-Object { $_ })
+        if ($allowed.Count -and $allowed -notcontains $domain) {
+            return @{ Allowed = $false; Reason = "SharePoint only allows sharing with an approved list of domains, and $domain is not on it. A SharePoint administrator maintains that list." }
+        }
+    }
+    elseif ($mode -eq 'blocklist') {
+        $blocked = @($Policy.BlockedDomains | ForEach-Object { "$_".Trim().ToLowerInvariant() } | Where-Object { $_ })
+        if ($blocked -contains $domain) {
+            return @{ Allowed = $false; Reason = "SharePoint blocks sharing with $domain. A SharePoint administrator maintains that list." }
+        }
+    }
+    return @{ Allowed = $true; Reason = '' }
 }
 
 function Grant-CBItemAccess {
@@ -119,8 +210,11 @@ function Grant-CBItemAccess {
         return @{ Ok = $true; Error = ''; WebUrl = $link }
     }
     catch {
+        $detail = "$($_.Exception.Message)"
         return @{ Ok = $false; WebUrl = ''
-            Error = (Get-CBShareFailureMessage -Message "$($_.Exception.Message)" -ItemName $ItemName -Recipient $Email)
+            Error = (Get-CBShareFailureMessage -Message $detail -ItemName $ItemName -Recipient $Email)
+            Detail = $detail
+            SitePolicy = [bool]($detail -match 'externalSharing|sharingDisabled|SharingDenied|invitationSendingDisabled|external sharing|could not be resolved|blocked by')
         }
     }
 }
@@ -142,21 +236,40 @@ function Add-CBSharedItemRecord {
         [Parameter(Mandatory)][string]$Name,
         [string]$WebUrl,
         [string]$Role,
-        [string]$SharedBy
+        [string]$SharedBy,
+        # What the access actually hangs off, so it can be taken away again. A
+        # record without these can be listed but never revoked, which is what
+        # every row written before this existed looks like.
+        [string]$DriveId,
+        [string]$ItemId,
+        [string]$GroupId
     )
     $existing = @()
     if ($Row.PSObject.Properties['SharedItems'] -and "$($Row.SharedItems)") {
         try { $existing = @("$($Row.SharedItems)" | ConvertFrom-Json) } catch { $existing = @() }
     }
     $entry = [ordered]@{
+        # An identifier of our own, so the portal can name one entry without
+        # relying on its position in a list that changes, or on a URL that may be
+        # empty.
+        id       = [Guid]::NewGuid().ToString('N').Substring(0, 12)
         kind     = $Kind
         name     = (ConvertTo-CBBoundedString -Value $Name -MaxLength 200 -Default 'an item')
         webUrl   = "$WebUrl"
         role     = "$Role"
         sharedBy = "$SharedBy"
+        driveId  = "$DriveId"
+        itemId   = "$ItemId"
+        groupId  = "$GroupId"
         sharedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
     }
-    $merged = @(@($entry) + @($existing | Where-Object { "$($_.webUrl)" -ne "$WebUrl" }) | Select-Object -First 50)
+    # Re-sharing the same thing replaces the old entry, including its sharer: the
+    # last person to grant it is the one who can take it away.
+    $merged = @(@($entry) + @($existing | Where-Object {
+                if ("$($_.itemId)" -and "$ItemId") { return "$($_.itemId)" -ne "$ItemId" }
+                if ("$($_.groupId)" -and "$GroupId") { return "$($_.groupId)" -ne "$GroupId" }
+                return "$($_.webUrl)" -ne "$WebUrl"
+            }) | Select-Object -First 50)
     $json = ($merged | ConvertTo-Json -Depth 5 -Compress)
     if ($json -notmatch '^\[') { $json = "[$json]" }   # ConvertTo-Json unwraps a single-element array
     Save-CBGuestRecord -OwnerId "$($Row.PartitionKey)" -GuestId "$($Row.RowKey)" -Properties @{ SharedItems = $json }
@@ -176,10 +289,37 @@ function Get-CBSharedItemView {
         ours to see, and implying otherwise would be worse than the gap: somebody
         deciding whether to remove a collaborator would read a short list as
         "this is all they can reach".
+
+        TWO PEOPLE CAN SHARE WITH THE SAME GUEST, and that is a normal thing to
+        want. It means this list is not automatically the viewer's to read: a
+        document name is itself information ("Redundancy plan Q3.xlsx"), and the
+        owner of a guest has no right to it merely because they own the guest.
+        So a viewer sees the names and links of what THEY shared, and everything
+        else as a count of its kind with who shared it and when.
+
+        Team names are not redacted. A Team is a named group of people inside the
+        company, its membership is visible to its members anyway, and knowing an
+        external person is in "Project Falcon" is not the same class of
+        disclosure as a file name.
+
+        Administrators see every name, because reviewing what an external party
+        can reach is the job. They still cannot revoke what they did not grant:
+        revocation runs as the person, delegated, and an administrator is not
+        automatically able to change a permission on somebody else's file. Doing
+        it for them would mean giving the managed identity write access to every
+        file in the tenant, which is a far larger thing than the convenience.
+    .PARAMETER ViewerUpn
+        Who is looking. Empty means nobody in particular, and nothing is named.
     .OUTPUTS
         An array of display-ready entries.
     #>
-    [CmdletBinding()] param([AllowNull()][string]$Json, [datetime]$Now = [datetime]::MinValue)
+    [CmdletBinding()]
+    param(
+        [AllowNull()][string]$Json,
+        [datetime]$Now = [datetime]::MinValue,
+        [AllowNull()][string]$ViewerUpn,
+        [switch]$ViewerIsAdmin
+    )
     if (-not "$Json".Trim()) { return @() }
     $items = @()
     try { $items = @("$Json" | ConvertFrom-Json) }
@@ -188,34 +328,214 @@ function Get-CBSharedItemView {
         return @()
     }
 
+    $viewer = "$ViewerUpn".Trim()
     $out = [System.Collections.Generic.List[object]]::new()
     foreach ($i in @($items)) {
         if (-not $i -or -not "$($i.name)") { continue }
         $kind = "$($i.kind)".Trim().ToLowerInvariant()
         $role = "$($i.role)".Trim().ToLowerInvariant()
-        # Only https survives into a link. These came from Graph rather than from
-        # a person, but a URL is one of the two places markup turns into
-        # behaviour, and an allowlist of one scheme is cheaper than being sure.
+        $sharedBy = "$($i.sharedBy)"
+        $mine = [bool]($viewer -and $sharedBy -and $viewer -eq $sharedBy)
+
+        # A Team's name is not a disclosure; a document's is. Everything else is
+        # named only for the person who shared it, or for an administrator.
+        $mayName = $mine -or $ViewerIsAdmin -or ($kind -eq 'team')
+
+        # Only https survives into a link, and only for somebody who may see the
+        # name anyway. A URL carries the file name in it, so handing one over
+        # would undo the redaction on the line above.
         $url = "$($i.webUrl)"
-        if ($url -notmatch '^https://') { $url = '' }
+        if ($url -notmatch '^https://' -or -not $mayName) { $url = '' }
+
+        $kindLabel = switch ($kind) { 'folder' { 'Folder' } 'team' { 'Team' } default { 'File' } }
+        # Only the person who granted it can take it away, because taking it away
+        # runs as them. An administrator sees why rather than a button that
+        # cannot work.
+        $canRevoke = $mine -and (("$($i.itemId)" -and "$($i.driveId)") -or "$($i.groupId)")
 
         $out.Add([ordered]@{
+                id        = "$($i.id)"
                 kind      = $(if ($kind) { $kind } else { 'file' })
-                kindLabel = $(switch ($kind) { 'folder' { 'Folder' } 'team' { 'Team' } default { 'File' } })
+                kindLabel = $kindLabel
                 icon      = $(switch ($kind) { 'folder' { 'folder' } 'team' { 'team' } default { Get-CBItemIcon -Name "$($i.name)" } })
-                name      = "$($i.name)"
+                name      = $(if ($mayName) { "$($i.name)" } else { "A $($kindLabel.ToLowerInvariant()) shared by somebody else" })
+                redacted  = (-not $mayName)
                 webUrl    = $url
-                role      = $role
-                roleLabel = $(switch ($kind) {
-                        'team' { 'Member' }
-                        default { if ($role -eq 'write') { 'Can edit' } elseif ($role -eq 'read') { 'Can view' } else { '' } }
+                role      = $(if ($mayName) { $role } else { '' })
+                roleLabel = $(if (-not $mayName) { '' }
+                    else {
+                        switch ($kind) {
+                            'team' { 'Member' }
+                            default { if ($role -eq 'write') { 'Can edit' } elseif ($role -eq 'read') { 'Can view' } else { '' } }
+                        }
                     })
-                sharedBy  = "$($i.sharedBy)"
+                sharedBy  = $sharedBy
+                sharedByYou = $mine
+                canRevoke = $canRevoke
+                revokeBlockedReason = $(if ($canRevoke) { '' }
+                    elseif (-not $mine) { "Only $(if ($sharedBy) { $sharedBy } else { 'the person who shared it' }) can take this back." }
+                    else { 'This was shared before Collaborate recorded enough to undo it. Remove it in SharePoint or Teams.' })
                 sharedAt  = "$($i.sharedAtUtc)"
                 sharedAtLabel = (Format-CBRelativeDate -Value "$($i.sharedAtUtc)" -Now $Now)
             })
     }
     return @($out)
+}
+
+function Remove-CBSharedAccess {
+    <#
+    .SYNOPSIS
+        Takes back one thing a guest was given, as the person who gave it.
+    .DESCRIPTION
+        Delegated, for the same reason granting is: the tool has no rights over
+        anybody's files and should not acquire any. That is also why only the
+        person who shared something can un-share it here. An administrator can
+        see everything a guest can reach, but revoking on somebody else's behalf
+        would mean the managed identity holding write access to every file in the
+        tenant. Reviewing is worth that trade; undoing one share is not.
+
+        For a drive item the permission is found by listing the item's
+        permissions and matching the guest, because Graph does not offer "remove
+        this person from this item" directly and the permission id was not ours
+        to keep. For a Team it is a group membership, which is removed by id.
+
+        The record is dropped whatever Graph said about a permission that is
+        already gone: a 404 means the access does not exist, which is the state
+        the caller asked for.
+    .OUTPUTS
+        @{ Ok; Status; Error; Message }
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Caller,
+        [Parameter(Mandatory)]$Row,
+        [Parameter(Mandatory)][string]$ItemKey,
+        $Settings
+    )
+    if (-not $Settings) { $Settings = Get-CBSettings }
+
+    $items = @()
+    try { $items = @("$($Row.SharedItems)" | ConvertFrom-Json) } catch { $items = @() }
+    $entry = $items | Where-Object { "$($_.id)" -eq $ItemKey } | Select-Object -First 1
+    if (-not $entry) { return @{ Ok = $false; Status = 404; Error = 'That is no longer in the list.' } }
+
+    if ("$($entry.sharedBy)" -ne "$($Caller.Upn)") {
+        return @{ Ok = $false; Status = 403
+            Error = "Only $(if ($entry.sharedBy) { $entry.sharedBy } else { 'the person who shared it' }) can take that back, because it is undone with their access, not ours."
+        }
+    }
+
+    $guestId = "$($Row.RowKey)"
+    $email = "$($Row.Email)"
+    $name = "$($entry.name)"
+    $kind = "$($entry.kind)".ToLowerInvariant()
+
+    if ($Settings.dryRun) {
+        Write-CBActivity -EventName "Would take back access to $name from $email" -Actor $Caller.Upn `
+            -OwnerId "$($Row.PartitionKey)" -GuestId $guestId -GuestUpn $email -GuestDisplayName "$($Row.DisplayName)" -Simulated
+        return @{ Ok = $true; Status = 200; Message = 'Simulation mode is on, so nothing was actually changed.' }
+    }
+
+    try {
+        if ($kind -eq 'team') {
+            if (-not "$($entry.groupId)") { return @{ Ok = $false; Status = 409; Error = 'This was recorded before Collaborate kept the Team id, so it has to be removed in Teams.' } }
+            $group = ConvertTo-CBGraphPathSegment -Value "$($entry.groupId)" -What 'group id'
+            $member = ConvertTo-CBGraphPathSegment -Value $guestId -What 'account id'
+            Invoke-CBGraphAsUser -Caller $Caller -Method Delete -Uri "/groups/$group/members/$member/`$ref" | Out-Null
+        }
+        else {
+            if (-not "$($entry.driveId)" -or -not "$($entry.itemId)") {
+                return @{ Ok = $false; Status = 409; Error = 'This was recorded before Collaborate kept enough to undo it. Remove it in SharePoint instead.' }
+            }
+            $drive = ConvertTo-CBGraphPathSegment -Value "$($entry.driveId)" -What 'drive id'
+            $item = ConvertTo-CBGraphPathSegment -Value "$($entry.itemId)" -What 'item id'
+            $permissions = @((Invoke-CBGraphAsUser -Caller $Caller -Uri "/drives/$drive/items/$item/permissions").value)
+            $matched = @($permissions | Where-Object { Test-CBPermissionGrantsTo -Permission $_ -GuestId $guestId -Email $email })
+            if ($matched.Count -eq 0) {
+                # Already gone, or granted some other way. Either way the guest
+                # does not hold it through us, so the record is the thing that is
+                # wrong.
+                Remove-CBSharedItemRecord -Row $Row -ItemKey $ItemKey
+                return @{ Ok = $true; Status = 200; Message = "$name was already not shared with $email any more, so it has been taken off the list." }
+            }
+            foreach ($p in $matched) {
+                $permId = ConvertTo-CBGraphPathSegment -Value "$($p.id)" -What 'permission id'
+                Invoke-CBGraphAsUser -Caller $Caller -Method Delete -Uri "/drives/$drive/items/$item/permissions/$permId" | Out-Null
+            }
+        }
+    }
+    catch {
+        $detail = "$($_.Exception.Message)"
+        # Gone already, or the site has since stopped allowing external people at
+        # all. In both cases SharePoint will not act, and in both cases the guest
+        # does not hold the access through us any more, so the record is what is
+        # wrong. Kept quiet on purpose: an owner tidying up should not be stuck
+        # with a row they cannot remove because somebody changed a site setting.
+        $benign = $detail -match 'itemNotFound|404|Resource.*not exist|sharingDisabled|SharingDenied|external sharing|could not be resolved|blocked by'
+        if (-not $benign) {
+            return @{ Ok = $false; Status = 502; Detail = $detail
+                Error = (Get-CBShareFailureMessage -Message $detail -ItemName $name -Recipient $email)
+            }
+        }
+        Remove-CBSharedItemRecord -Row $Row -ItemKey $ItemKey
+        Write-CBActivity -EventName "Removed the record of $name for $email without SharePoint acting" -Actor $Caller.Upn `
+            -OwnerId "$($Row.PartitionKey)" -GuestId $guestId -GuestUpn $email -GuestDisplayName "$($Row.DisplayName)" `
+            -Detail @{ kind = $kind; name = $name; why = $detail }
+        return @{ Ok = $true; Status = 200
+            Message = "$name has been taken off the list. SharePoint would not confirm the change, which usually means the access was already gone or the site no longer allows external people at all. Check the site itself if you need to be certain."
+        }
+    }
+
+    Remove-CBSharedItemRecord -Row $Row -ItemKey $ItemKey
+    Write-CBActivity -EventName "Took back $($entry.kind) access to $name from $email" -Actor $Caller.Upn `
+        -OwnerId "$($Row.PartitionKey)" -GuestId $guestId -GuestUpn $email -GuestDisplayName "$($Row.DisplayName)" `
+        -Detail @{ kind = $kind; name = $name }
+    return @{ Ok = $true; Status = 200; Message = "$email can no longer reach $name." }
+}
+
+function Test-CBPermissionGrantsTo {
+    <#
+    .SYNOPSIS
+        Does this drive-item permission belong to this guest?
+    .DESCRIPTION
+        Pure, and deliberately generous about where Graph puts the identity:
+        grantedToV2 for a single grantee, grantedToIdentitiesV2 for several, and
+        the older grantedTo / grantedToIdentities on some drives. Matching on the
+        object id where there is one and the address otherwise, because a guest
+        invited but not yet redeemed can appear by address alone.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)]$Permission, [string]$GuestId, [string]$Email)
+    $identities = @(
+        $Permission.grantedToV2, $Permission.grantedTo
+    ) + @($Permission.grantedToIdentitiesV2) + @($Permission.grantedToIdentities)
+
+    foreach ($identity in $identities) {
+        if (-not $identity) { continue }
+        $user = $identity.user
+        if (-not $user) { continue }
+        if ($GuestId -and "$($user.id)" -eq $GuestId) { return $true }
+        if ($Email -and "$($user.email)" -eq $Email) { return $true }
+        # SharePoint sometimes carries the address in displayName for a guest
+        # that has not redeemed yet, and nowhere else.
+        if ($Email -and "$($user.displayName)" -eq $Email) { return $true }
+    }
+    return $false
+}
+
+function Remove-CBSharedItemRecord {
+    <#
+    .SYNOPSIS
+        Drops one entry from a guest's shared-item list.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)]$Row, [Parameter(Mandatory)][string]$ItemKey)
+    $items = @()
+    try { $items = @("$($Row.SharedItems)" | ConvertFrom-Json) } catch { $items = @() }
+    $kept = @($items | Where-Object { "$($_.id)" -ne $ItemKey })
+    $json = ($kept | ConvertTo-Json -Depth 5 -Compress)
+    if (-not $json) { $json = '[]' }
+    if ($json -notmatch '^\[') { $json = "[$json]" }   # ConvertTo-Json unwraps a single-element array
+    Save-CBGuestRecord -OwnerId "$($Row.PartitionKey)" -GuestId "$($Row.RowKey)" -Properties @{ SharedItems = $json }
+    return @($kept)
 }
 
 function Resolve-CBShareRecipient {
@@ -361,6 +681,18 @@ function Invoke-CBShareRequest {
         $targetUrl = "$($item.webUrl)"
     }
 
+    # What SharePoint will refuse anyway, checked before a guest account is
+    # created for it. Tenant level only; a site that blocks sharing inside a
+    # tenant that allows it is not visible here and shows up at the grant.
+    if ($kind -ne 'team') {
+        $policy = Get-CBTenantSharingPolicy
+        $wanted = if ("$($NewGuest.email)") { "$($NewGuest.email)" } else { '' }
+        $allowed = Test-CBTenantAllowsSharingWith -Email $wanted -Policy $policy
+        if (-not $allowed.Allowed) {
+            return @{ Ok = $false; Status = 409; Error = $allowed.Reason; TenantPolicy = $true }
+        }
+    }
+
     # Only a target the welcome page will accept is put into the invitation; an
     # unrecognised host is dropped there rather than turning the page into an
     # open redirect. Get-CBWelcomeUrl enforces the same list.
@@ -386,10 +718,13 @@ function Invoke-CBShareRequest {
     # --- Grant the access, as the user -------------------------------------
     $shareOk = $false
     $shareError = ''
+    $shareDetail = ''
+    $sitePolicy = $false
     if ($kind -eq 'team') {
         $add = Add-CBTeamGuest -Caller $Caller -TeamId "$($Target.teamId)" -GuestId "$($recipient.Row.RowKey)"
         $shareOk = $add.Ok
         $shareError = $add.Error
+        $shareDetail = "$($add.Detail)"
         if ($add.AlreadyMember) { $warnings.Add("$($recipient.DisplayName) was already in $targetName.") }
     }
     else {
@@ -397,6 +732,8 @@ function Invoke-CBShareRequest {
             -Email "$($recipient.Email)" -Role $role -ItemName $targetName -Message $Message
         $shareOk = $grant.Ok
         $shareError = $grant.Error
+        $shareDetail = "$($grant.Detail)"
+        $sitePolicy = [bool]$grant.SitePolicy
     }
 
     if (-not $shareOk) {
@@ -408,15 +745,22 @@ function Invoke-CBShareRequest {
         # their id, so the portal can retry the share alone instead of inviting
         # the same person a second time.
         return @{
-            Ok = $false; Status = 502; Error = $shareError
+            Ok = $false; Status = 502; Error = $shareError; Detail = $shareDetail
             GuestCreated = [bool]$recipient.Created
             Guest = [ordered]@{ id = "$($recipient.Row.RowKey)"; displayName = "$($recipient.DisplayName)"; email = "$($recipient.Email)" }
             Warnings = @($warnings)
             Retryable = $true
+            # The site refused external sharing outright. The portal remembers
+            # that for the session so nobody walks the same site twice.
+            SitePolicy = $sitePolicy
+            SiteId = "$($Target.siteId)"
         }
     }
 
-    $shared = Add-CBSharedItemRecord -Row $recipient.Row -Kind $kind -Name $targetName -WebUrl $targetUrl -Role $role -SharedBy $Caller.Upn
+    $shared = Add-CBSharedItemRecord -Row $recipient.Row -Kind $kind -Name $targetName -WebUrl $targetUrl -Role $role -SharedBy $Caller.Upn `
+        -DriveId $(if ($kind -eq 'team') { '' } else { "$($Target.driveId)" }) `
+        -ItemId $(if ($kind -eq 'team') { '' } else { "$($Target.itemId)" }) `
+        -GroupId $(if ($kind -eq 'team') { "$($Target.teamId)" } else { '' })
 
     # --- Now, and only now, tell the guest ---------------------------------
     $values = if ($recipient.MailValues) { $recipient.MailValues } else { Get-CBGuestMailValue -Row $recipient.Row -Settings $Settings }

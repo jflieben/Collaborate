@@ -60,6 +60,8 @@ try {
         # empty list is the same message whether the person has never opened a
         # file or the tenant has switched the data source off.
         emptyReason  = "$($result.EmptyReason)"
+        # Only the siteinfo pane fills this in.
+        siteSettings = $result.SiteSettings
         capabilities = [ordered]@{
             files   = [bool]$settings.sharing.files
             folders = [bool]$settings.sharing.folders
@@ -73,17 +75,29 @@ catch {
     Write-Error "BrowseApi failed: $detail"
 
     # These reach an ordinary employee mid-task, so say what it means for them.
-    # A 404 here is almost always a site or library they cannot open rather than
-    # a fault, and "Graph Get returned HTTP 404" helps nobody.
+    # The raw text goes back as 'detail' for the expandable section, never as the
+    # sentence: "Graph Get returned HTTP 404" helps nobody in the middle of
+    # picking a file, and helps support a great deal once it is copied.
+    $where = if ($pane -eq 'children' -and "$($query['siteId'])") { 'site' } else { 'folder' }
     if ($detail -match 'HTTP 404|itemNotFound|could not be found') {
-        Send-Json -Status 404 -Object @{ error = 'That site or folder could not be opened. It may have been removed, or you may not have access to it.' }
+        Send-Json -Status 404 -Object @{
+            detail = $detail
+            error  = $(if ($where -eq 'site') {
+                    'That site no longer exists. SharePoint keeps deleted sites in your followed list, so it can still appear here.'
+                }
+                else { 'That folder could not be opened. It may have been moved or removed since the list was loaded.' })
+        }
         return
     }
     if ($detail -match 'HTTP 403|accessDenied|Forbidden') {
-        Send-Json -Status 403 -Object @{ error = 'You do not have access to that. Only things you can already open appear here.' }
+        Send-Json -Status 403 -Object @{
+            error  = "You do not have access to that $where. Only things you can already open yourself appear here."
+            detail = $detail
+        }
         return
     }
-    # An on-behalf-of failure is a setup problem with an actionable message, and
-    # the user should see it rather than a generic 500.
-    Send-Json -Status 502 -Object @{ error = $detail }
+    Send-Json -Status 502 -Object @{
+        error  = "That $where could not be opened. This is not something you did wrong; the details below are what support needs."
+        detail = $detail
+    }
 }

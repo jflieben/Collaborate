@@ -130,7 +130,7 @@ function Invoke-CBGraph {
         }
 
         if ($statusCode -ge 400) {
-            throw (New-CBGraphError -StatusCode $statusCode -Response $response -Method $Method -Uri $Uri)
+            throw (New-CBGraphError -StatusCode $statusCode -Response $response -Method $Method -Uri $Uri -Headers $respHeaders)
         }
 
         if ($All -and $response -and ($response.PSObject.Properties.Name -contains 'value')) {
@@ -153,20 +153,37 @@ function New-CBGraphError {
         raw payload last.
     #>
     [CmdletBinding()]
-    param([int]$StatusCode, $Response, [string]$Method, [string]$Uri)
+    param([int]$StatusCode, $Response, [string]$Method, [string]$Uri, $Headers)
     $message = ''
+    $code = ''
+    $requestId = ''
     if ($Response -and $Response.PSObject.Properties['error']) {
         $message = "$($Response.error.message)".Trim()
+        $code = "$($Response.error.code)".Trim()
+        if ($Response.error.PSObject.Properties['innerError']) {
+            $requestId = "$($Response.error.innerError.'request-id')".Trim()
+        }
+    }
+    if (-not $requestId -and $Headers) {
+        foreach ($name in @('request-id', 'client-request-id')) {
+            try { if ($Headers[$name]) { $requestId = "$(@($Headers[$name])[0])".Trim(); break } } catch { }
+        }
     }
     if (-not $message) {
         $message = if ($Response) { ($Response | ConvertTo-Json -Depth 8 -Compress) } else { '(no body)' }
     }
-    # The URL goes to the log, not into the message. These errors are shown to end
-    # users (a share can fail because a site forbids external sharing) and a drive
-    # item URL in the middle of that sentence helps nobody, while the operator
-    # reading Application Insights does want it.
-    Write-Warning "Graph $Method $Uri failed with HTTP ${StatusCode}: $message"
-    return "Graph $Method returned HTTP ${StatusCode}: $message"
+
+    # The code and request id are what support asks for first, so they travel with
+    # the message rather than only into the log.
+    $tail = @()
+    if ($code) { $tail += "code $code" }
+    if ($requestId) { $tail += "request id $requestId" }
+    $suffix = if ($tail.Count) { ' (' + ($tail -join ', ') + ')' } else { '' }
+
+    # The URL goes to the log, not into the message: an operator reading
+    # Application Insights wants it, a user reading the portal does not.
+    Write-Warning "Graph $Method $Uri failed with HTTP ${StatusCode}: $message$suffix"
+    return "Graph $Method returned HTTP ${StatusCode}: $message$suffix"
 }
 
 function Get-CBGraphErrorCode {
@@ -179,6 +196,8 @@ function Get-CBGraphErrorCode {
     [CmdletBinding()] param($ErrorRecord)
     $text = "$($ErrorRecord)"
     if ($text -match '"code"\s*:\s*"([^"]+)"') { return $Matches[1] }
+    # The readable form New-CBGraphError produces: "... (code itemNotFound, ...)".
+    if ($text -match '\(code ([A-Za-z_][A-Za-z0-9_.]*)') { return $Matches[1] }
     return ''
 }
 

@@ -99,7 +99,7 @@ try {
         }
         $access = Test-CBGuestAccess -Caller $caller -GuestId $wantedId
         if (-not $access.Ok) { Send-Json -Status $access.Status -Object @{ error = $access.Error }; return }
-        $view = Get-CBGuestView -Row $access.Row -Settings $settings -IncludeOwner -IncludeShared
+        $view = Get-CBGuestView -Row $access.Row -Settings $settings -IncludeOwner -IncludeShared -Viewer $caller
         $view.actions = @(Get-CBGuestActionOption -Row $access.Row -Caller $caller -Settings $settings -State $view.state)
         Write-CBHeartbeatSampled -Name 'GuestsApi'
         Send-Json -Status 200 -Object @{ guest = $view }

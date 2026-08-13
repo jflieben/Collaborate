@@ -46,7 +46,7 @@ function Get-CBEmailCatalog {
             subject = '{{owner.displayName}} shared {{shareName}} with you'
             body = @'
 <p>Hello {{guest.displayName}},</p>
-<p><strong>{{owner.displayName}}</strong> ({{owner.email}}) has shared the {{shareKind}} <strong>{{shareName}}</strong> with you at {{brand.companyName}}.</p>
+<p><strong>{{owner.displayName}}</strong> ({{owner.email}}) has shared the {{shareKind}} <strong>{{shareName}}</strong> with you.</p>
 <p><em>{{reason}}</em></p>
 <p>First, accept the invitation. You can sign in with your own work or personal account: you do not need a new password.</p>
 <p><a class="cb-button" href="{{redeemUrl}}">Accept and open {{shareName}}</a></p>
@@ -60,7 +60,7 @@ function Get-CBEmailCatalog {
             subject = '{{sharedBy.displayName}} shared {{shareName}} with you'
             body = @'
 <p>Hello {{guest.displayName}},</p>
-<p><strong>{{sharedBy.displayName}}</strong> ({{sharedBy.email}}) has shared the {{shareKind}} <strong>{{shareName}}</strong> with you at {{brand.companyName}}.</p>
+<p><strong>{{sharedBy.displayName}}</strong> ({{sharedBy.email}}) has shared the {{shareKind}} <strong>{{shareName}}</strong> with you.</p>
 <p><em>{{message}}</em></p>
 <p><a class="cb-button" href="{{shareUrl}}">Open {{shareName}}</a></p>
 <p>Sign in with the same account you used before. Your access runs until <strong>{{expiresOn}}</strong>.</p>

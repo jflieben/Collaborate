@@ -1,14 +1,16 @@
 {
   "_comment": "Single source of truth for what Collaborate needs in Entra. Edit ONLY here: Deploy-Collaborate.ps1 and Update-Collaborate.ps1 both reconcile against this file and grant whatever is missing (idempotent). 'appRoles' and 'directoryRoles' are granted to the Function App's MANAGED IDENTITY and cover administration. 'delegatedScopes' are granted to the PORTAL APP REGISTRATION and are only ever used on behalf of a signed-in user, so Graph enforces that user's own rights. Granting still needs the operator to be Global Administrator or Privileged Role Administrator.",
   "resources": {
-    "graph": { "appId": "00000003-0000-0000-c000-000000000000", "displayName": "Microsoft Graph" }
+    "graph": { "appId": "00000003-0000-0000-c000-000000000000", "displayName": "Microsoft Graph" },
+    "sharepoint": { "appId": "00000003-0000-0ff1-ce00-000000000000", "displayName": "Office 365 SharePoint Online" }
   },
   "appRoles": [
     { "resource": "graph", "value": "User.Invite.All", "reason": "create B2B invitations on behalf of employees who cannot invite themselves" },
     { "resource": "graph", "value": "User.ReadWrite.All", "reason": "read guests, write the expiry date to the extension attribute, block sign-in, set the sponsor" },
     { "resource": "graph", "value": "User.DeleteRestore.All", "reason": "delete a guest once the grace period lapses, and restore one that is renewed in time" },
     { "resource": "graph", "value": "Directory.Read.All", "reason": "resolve the inviter group, verified domains, guest search and the owner people picker" },
-    { "resource": "graph", "value": "AuditLog.Read.All", "reason": "signInActivity for inactive-guest cleanup, and invite events when adopting guests that predate the tool" }
+    { "resource": "graph", "value": "AuditLog.Read.All", "reason": "signInActivity for inactive-guest cleanup, and invite events when adopting guests that predate the tool" },
+    { "resource": "graph", "value": "SharePointTenantSettings.Read.All", "reason": "read the tenant's external sharing capability and allowed/blocked domain lists, so a share that cannot possibly work is refused before a guest account is created. Read-only, and tenant-level only: SharePoint does not expose the per-site setting through Graph" }
   ],
   "directoryRoles": [
     { "displayName": "Guest Inviter", "templateId": "95e79109-95c0-4d8e-aee3-d01accf2d47b", "reason": "invitations keep working when the tenant restricts guest invitations to admin roles, which is exactly the tenant this tool is built for" }
@@ -20,6 +22,7 @@
     { "resource": "graph", "value": "TeamMember.ReadWrite.All", "reason": "add a guest to a Team the user owns, as that user" },
     { "resource": "graph", "value": "GroupMember.ReadWrite.All", "reason": "the group membership behind a Team add, as that user" },
     { "resource": "graph", "value": "Team.ReadBasic.All", "reason": "read a Team's web address so the guest gets a link straight into it rather than the generic Teams page; the tool works without this and falls back" },
+    { "resource": "sharepoint", "value": "AllSites.Read", "usedBy": "sharepoint", "reason": "read a site's own settings (external sharing, lock state) as the signed-in user. Graph does not expose them, and the tenant admin API needs SharePoint administrator rights an employee does not have. Read-only" },
     { "resource": "graph", "value": "Mail.Send", "usedBy": "browser", "reason": "send an invitation from the inviter's own mailbox, when the tenant has chosen that. Requested by the PORTAL in the browser, never by the Function App: a delegated Mail.Send used server-side would appear to Conditional Access as a sign-in from a datacentre, and an application Mail.Send on the managed identity would let this tool send as anybody" }
   ]
 }

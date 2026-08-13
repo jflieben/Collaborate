@@ -90,10 +90,20 @@ confirms, and closes.
 ### What a collaborator can reach
 
 The panel lists what Collaborate granted: files, folders and Teams, newest
-first, with the role, who shared it and when, each linking out to the real thing.
+first, with **who shared it** first on the line, the role, and when.
+
+Two colleagues can share with the same guest. You see the name and link of what **you** shared, with an
+**Unshare** button; anything a colleague shared appears as its kind and their
+name, without the document name or a link. Team names are never hidden.
+[sharing.md](sharing.md#two-people-sharing-with-the-same-guest) has the full
+table and the reasoning.
 
 The panel says plainly that **access given directly in SharePoint or Teams is not
 listed**, because it was never Collaborate's to see. Only a tool like M365Permissions.com can do that kind of fancy stuff.
+
+**Share something now** (or **Share something else**) starts the share wizard with
+this collaborator already chosen, so it runs in two steps rather than three. It
+is hidden once their access has ended.
 
 ### What an owner can do to a guest
 

@@ -72,6 +72,37 @@
     return s.slice(0, 8).toLowerCase() === "https://" ? s : "";
   }
 
+  // A failure as two things: a sentence, and the detail support asks for. The
+  // detail is collapsed, because an employee mid-task should not have to read a
+  // Graph error to understand that a site refused them.
+  var errorSeq = 0;
+  function errorHtml(e) {
+    var detail = (e && e.data && e.data.detail) || "";
+    var html = '<p class="status bad">' + esc(e.message || "Something went wrong.") + "</p>";
+    if (!detail) { return html; }
+    var id = "errDetail" + (++errorSeq);
+    var body = detail + "\n\nWhen: " + new Date().toISOString() +
+      "\nVersion: " + ((state.me && state.me.version) || "?");
+    return html +
+      '<details class="tech"><summary>Technical details</summary>' +
+      '<pre id="' + id + '">' + esc(body) + "</pre>" +
+      '<button type="button" class="btn small ghost" data-copy="' + id + '">Copy for support</button>' +
+      "</details>";
+  }
+
+  // Wires any copy buttons inside a container that has just been rendered.
+  function wireCopyButtons(host) {
+    host.querySelectorAll("[data-copy]").forEach(function (b) {
+      b.onclick = function () {
+        var text = (el(b.dataset.copy) || {}).textContent || "";
+        if (navigator.clipboard) {
+          navigator.clipboard.writeText(text).then(function () { toast("Copied.", "ok"); },
+            function () { toast("Could not copy. Select the text and copy it.", "bad"); });
+        } else { toast("Select the text and copy it.", "bad"); }
+      };
+    });
+  }
+
   function truthy(v) {
     if (typeof v === "string") { return !(v === "" || v.toLowerCase() === "false" || v === "0"); }
     return !!v;
@@ -378,30 +409,64 @@
     });
   }
 
+  // Drawn for these three actions rather than borrowed emoji. A dashed stroke
+  // means "outside the company" in all three, which is the one idea the whole
+  // tool is about.
+  var CHOICE_ICONS = {
+    collaborators:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<circle cx="8.5" cy="7.5" r="3.2"/>' +
+      '<path d="M2.5 19.5v-.9c0-2.9 2.7-5.1 6-5.1s6 2.2 6 5.1v.9"/>' +
+      '<circle cx="17" cy="8.5" r="2.6" stroke-dasharray="2 1.9"/>' +
+      '<path d="M12.8 19.5v-.6c0-2.3 2.1-4.1 4.2-4.1s4.2 1.8 4.2 4.1v.6" stroke-dasharray="2 1.9"/>' +
+      "</svg>",
+    share:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<rect x="2.5" y="3" width="10" height="18" rx="2"/>' +
+      '<path d="M5.5 8h4M5.5 11.5h4M5.5 15h2.5"/>' +
+      '<path d="M17 2.5v19" stroke-dasharray="1.9 2.2"/>' +
+      '<path d="M13 12h8.5"/><path d="M18.8 9.3 21.5 12l-2.7 2.7"/>' +
+      "</svg>",
+    team:
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<rect x="2.5" y="4" width="14" height="14" rx="3"/>' +
+      '<circle cx="9.5" cy="9" r="2.2"/>' +
+      '<path d="M5.8 15.4c0-2 1.7-3.7 3.7-3.7s3.7 1.7 3.7 3.7"/>' +
+      // style, not a fill attribute: a custom property does not resolve in a
+      // presentation attribute, and the badge has to knock out the box behind it.
+      '<circle cx="17.8" cy="17.8" r="4.2" style="fill:var(--surface)" stroke-dasharray="2 1.9"/>' +
+      '<path d="M17.8 15.8v4M15.8 17.8h4"/>' +
+      "</svg>"
+  };
+
   function renderHome() {
     var me = state.me;
     var caps = me.capabilities;
     var cards = [
       {
-        icon: "👥",
+        icon: "collaborators",
         label: "Manage external collaborators",
         hint: "See who you have invited, and invite somebody new.",
         enabled: true,
         go: function () { showView("guests"); }
       },
       {
-        icon: "📄",
-        // Says what this tenant actually allows. Offering to "share a file or
-        // folder" when only one of the two is switched on is a promise the next
-        // screen breaks.
+        icon: "share",
+        // Says what this tenant actually allows, rather than promising something
+        // the next screen refuses.
         label: "Share a " + shareLabel(),
         hint: "Pick something from SharePoint or your OneDrive and give an outsider access to just that.",
-        enabled: caps.shareFiles || caps.shareFolders,
-        disabledHint: "An administrator has switched file and folder sharing off.",
+        // SharePoint's own tenant setting counts as much as ours: with it off,
+        // every share fails, and finding that out after picking a file and a
+        // person is the worst possible moment.
+        enabled: (caps.shareFiles || caps.shareFolders) && sharingAllowed().ok,
+        disabledHint: sharingAllowed().ok
+          ? "An administrator has switched file and folder sharing off."
+          : sharingAllowed().note,
         go: function () { startShare("files"); }
       },
       {
-        icon: "👥",
+        icon: "team",
         label: "Add someone to a Team",
         hint: "Add an external person to a Team you own, if that Team allows guests.",
         enabled: caps.shareTeams,
@@ -419,7 +484,7 @@
       btn.className = "choice";
       btn.type = "button";
       if (!c.enabled) { btn.disabled = true; }
-      btn.innerHTML = '<span class="icon" aria-hidden="true">' + c.icon + "</span>" +
+      btn.innerHTML = '<span class="icon">' + (CHOICE_ICONS[c.icon] || "") + "</span>" +
         '<span class="label">' + esc(c.label) + "</span>" +
         '<span class="hint">' + esc(c.enabled ? c.hint : c.disabledHint) + "</span>";
       if (c.enabled) { btn.onclick = c.go; }
@@ -476,6 +541,16 @@
 
   /* ---------------- external collaborators ---------------- */
 
+  // SharePoint's tenant-wide external sharing setting. Unknown counts as allowed:
+  // an unreadable policy must not disable a working feature.
+  function sharingAllowed() {
+    var p = (state.me && state.me.sharingPolicy) || {};
+    if (truthy(p.known) && !truthy(p.allowsExternal)) {
+      return { ok: false, note: p.note || "SharePoint does not allow external sharing in this tenant." };
+    }
+    return { ok: true, note: "" };
+  }
+
   // "file", "folder" or "file or folder", from what the administrator allows.
   function shareLabel() {
     var c = (state.me && state.me.capabilities) || {};
@@ -519,17 +594,35 @@
     });
   }
 
-  // Filtering happens in the browser over the list already fetched. The whole
-  // tenant's guests are a few thousand rows at most, and a round trip per
-  // keystroke to filter data we already have would be slower and no more
-  // correct: the API decided what this person may see before it sent it.
+  /* --- sorting and filtering, in the browser ---
+     The whole tenant's guests are a few thousand rows at most and they are
+     already here, so a round trip per keystroke would be slower and no more
+     correct: the API decided what this person may see before it sent it. */
+
+  var GUEST_STATES = [
+    ["blocked", "switched off"], ["expired", "ended"], ["expiring", "ending soon"],
+    ["pending", "waiting to accept"], ["active", "active"], ["deleted", "removed"]
+  ];
+
+  // The same order the server sorts by, so sorting the status column ascending
+  // means "most in need of attention first" rather than alphabetically, which
+  // would put "active" above "blocked" and bury the only rows that matter.
+  function stateRank(s) {
+    for (var i = 0; i < GUEST_STATES.length; i++) { if (GUEST_STATES[i][0] === s) { return i; } }
+    return GUEST_STATES.length;
+  }
+
+  function guestFilterState() {
+    if (!state.guestFilter) { state.guestFilter = { who: "", states: [] }; }
+    return state.guestFilter;
+  }
+
   function applyGuestFilters(items) {
-    if (!state.guestsShowAll) { return items; }
-    var wanted = el("guestsState").value;
-    var unownedOnly = el("guestsUnowned").checked;
-    var term = el("guestsFilter").value.trim().toLowerCase();
+    var f = guestFilterState();
+    var unownedOnly = state.guestsShowAll && el("guestsUnowned").checked;
+    var term = f.who.trim().toLowerCase();
     return items.filter(function (g) {
-      if (wanted && g.state !== wanted) { return false; }
+      if (f.states.length && f.states.indexOf(g.state) < 0) { return false; }
       if (unownedOnly && !g.orphaned) { return false; }
       if (term) {
         var hay = [g.displayName, g.email, g.reason, g.owner ? g.owner.displayName : ""].join(" ").toLowerCase();
@@ -539,15 +632,136 @@
     });
   }
 
+  function applyGuestSort(items) {
+    var s = state.guestSort;
+    // No explicit sort means the server's order: attention first, then soonest
+    // to end. That is the useful default and it is worth keeping.
+    if (!s || !s.key) { return items; }
+    var dir = s.dir === "desc" ? -1 : 1;
+    var sorted = items.slice();
+    sorted.sort(function (a, b) {
+      var x, y;
+      if (s.key === "who") {
+        x = (a.displayName || a.email || "").toLowerCase();
+        y = (b.displayName || b.email || "").toLowerCase();
+        return dir * x.localeCompare(y);
+      }
+      if (s.key === "status") {
+        x = stateRank(a.state); y = stateRank(b.state);
+        if (x !== y) { return dir * (x - y); }
+        return dir * ((a.daysLeft || 0) - (b.daysLeft || 0));
+      }
+      // Last active. Never signed in sorts last whichever way round it is
+      // pointing: "no date" is not a very old date, and putting a hundred blanks
+      // at the top of a descending sort helps nobody.
+      x = a.lastSignIn || ""; y = b.lastSignIn || "";
+      if (!x && !y) { return 0; }
+      if (!x) { return 1; }
+      if (!y) { return -1; }
+      return dir * (x < y ? -1 : (x > y ? 1 : 0));
+    });
+    return sorted;
+  }
+
+  function sortIndicator(key) {
+    var s = state.guestSort;
+    if (!s || s.key !== key) { return '<span class="sort-mark" aria-hidden="true">↕</span>'; }
+    return '<span class="sort-mark on" aria-hidden="true">' + (s.dir === "desc" ? "↓" : "↑") + "</span>";
+  }
+
+  function headerCell(key, label, filterable) {
+    var f = guestFilterState();
+    var active = (key === "status" && f.states.length) || (key === "who" && f.who);
+    return "<th>" +
+      '<button type="button" class="th-sort" data-sort="' + key + '" title="Sort by ' + esc(label) + '">' +
+      esc(label) + sortIndicator(key) + "</button>" +
+      (filterable
+        ? '<button type="button" class="th-filter' + (active ? " on" : "") + '" data-filter="' + key +
+        '" title="Filter" aria-label="Filter by ' + esc(label) + '">⋮</button>'
+        : "") +
+      "</th>";
+  }
+
+  function closeHeaderMenu() {
+    var open = document.getElementById("thMenu");
+    if (open) { open.remove(); }
+  }
+
+  function openHeaderMenu(key, anchor) {
+    closeHeaderMenu();
+    var f = guestFilterState();
+    var menu = document.createElement("div");
+    menu.id = "thMenu";
+    menu.className = "th-menu";
+
+    if (key === "who") {
+      menu.innerHTML = '<label class="field"><span>Contains</span>' +
+        '<input id="thWho" type="text" value="' + esc(f.who) + '" placeholder="name, address or domain" /></label>' +
+        '<div class="row"><button class="btn small primary" id="thApply">Apply</button>' +
+        '<button class="btn small ghost" id="thClear">Clear</button></div>';
+    } else {
+      // Every state, with the ones present in this list counted. Offering a
+      // state nobody has would be a filter that always returns nothing.
+      var counts = {};
+      (state.guests && state.guests.items ? state.guests.items : []).forEach(function (g) {
+        counts[g.state] = (counts[g.state] || 0) + 1;
+      });
+      menu.innerHTML = GUEST_STATES.map(function (p) {
+        var checked = f.states.indexOf(p[0]) >= 0;
+        return '<label class="checkline small"><input type="checkbox" data-state="' + p[0] + '"' +
+          (checked ? " checked" : "") + " /><span>" + esc(p[1]) +
+          ' <span class="muted">(' + (counts[p[0]] || 0) + ")</span></span></label>";
+      }).join("") +
+        '<div class="row"><button class="btn small primary" id="thApply">Apply</button>' +
+        '<button class="btn small ghost" id="thClear">Clear</button></div>';
+    }
+
+    document.body.appendChild(menu);
+    var box = anchor.getBoundingClientRect();
+    menu.style.top = (box.bottom + window.scrollY + 4) + "px";
+    menu.style.left = Math.max(8, Math.min(box.left + window.scrollX, window.innerWidth - menu.offsetWidth - 8)) + "px";
+
+    if (el("thWho")) {
+      el("thWho").focus();
+      el("thWho").addEventListener("keydown", function (e) { if (e.key === "Enter") { el("thApply").click(); } });
+    }
+    el("thApply").onclick = function () {
+      if (key === "who") { f.who = el("thWho").value; }
+      else {
+        f.states = Array.prototype.slice.call(menu.querySelectorAll("[data-state]"))
+          .filter(function (c) { return c.checked; })
+          .map(function (c) { return c.dataset.state; });
+      }
+      closeHeaderMenu();
+      renderGuests(state.guests, state.guestsShowAll);
+    };
+    el("thClear").onclick = function () {
+      if (key === "who") { f.who = ""; } else { f.states = []; }
+      closeHeaderMenu();
+      renderGuests(state.guests, state.guestsShowAll);
+    };
+  }
+
+  document.addEventListener("click", function (e) {
+    var menu = document.getElementById("thMenu");
+    if (menu && !menu.contains(e.target) && !e.target.closest("[data-filter]")) { closeHeaderMenu(); }
+  });
+  document.addEventListener("keydown", function (e) { if (e.key === "Escape") { closeHeaderMenu(); } });
+
   function renderGuests(data, showOwner) {
     var all = data.items || [];
-    var items = applyGuestFilters(all);
+    var items = applyGuestSort(applyGuestFilters(all));
     var counts = data.counts || {};
 
     el("guestsFilters").hidden = !showOwner;
     el("guestsEmpty").hidden = all.length > 0;
     if (all.length && !items.length) {
-      el("guestTable").innerHTML = '<p class="muted small">Nothing matches that filter.</p>';
+      el("guestTable").innerHTML = '<p class="muted small">Nothing matches that filter. ' +
+        '<button type="button" class="linkish" id="guestsClearFilters">Clear the filters</button></p>';
+      el("guestsClearFilters").onclick = function () {
+        state.guestFilter = { who: "", states: [] };
+        renderGuests(state.guests, state.guestsShowAll);
+      };
       renderBulkBar();
       return;
     }
@@ -575,7 +789,8 @@
     if (!items.length) { el("guestTable").innerHTML = ""; renderBulkBar(); return; }
     var seen = signInData();
     var head = "<tr>" + (showOwner ? '<th><input id="guestsSelAll" type="checkbox" title="Select everything shown" /></th>' : "") +
-      "<th>Who</th><th>Status</th>" + (seen.available ? "<th>Last active</th>" : "") +
+      headerCell("who", "Who", true) + headerCell("status", "Status", true) +
+      (seen.available ? headerCell("active", "Last active", false) : "") +
       "<th>Why</th>" + (showOwner ? "<th>Owner</th>" : "") + "<th></th></tr>";
     var rows = items.map(function (g, index) {
       var owner = "";
@@ -613,6 +828,29 @@
     el("guestTable").querySelectorAll("[data-guest-open]").forEach(function (b) {
       b.onclick = function () { openGuest(items[Number(b.dataset.guestOpen)]); };
     });
+    el("guestTable").querySelectorAll("[data-sort]").forEach(function (b) {
+      b.onclick = function () {
+        var key = b.dataset.sort;
+        var s = state.guestSort;
+        // Third click returns to the server's order rather than leaving you
+        // stuck in one of two sorts with no way back to the useful default.
+        if (!s || s.key !== key) { state.guestSort = { key: key, dir: "asc" }; }
+        else if (s.dir === "asc") { state.guestSort = { key: key, dir: "desc" }; }
+        else { state.guestSort = null; }
+        renderGuests(state.guests, state.guestsShowAll);
+      };
+    });
+    el("guestTable").querySelectorAll("[data-filter]").forEach(function (b) {
+      b.onclick = function (e) { e.stopPropagation(); openHeaderMenu(b.dataset.filter, b); };
+    });
+
+    var f = guestFilterState();
+    var active = [];
+    if (f.who) { active.push('who contains "' + f.who + '"'); }
+    if (f.states.length) { active.push("status: " + f.states.join(", ")); }
+    if (el("guestsActiveFilters")) {
+      el("guestsActiveFilters").textContent = active.length ? "Filtered by " + active.join("; ") : "";
+    }
     el("guestTable").querySelectorAll("[data-select]").forEach(function (c) {
       c.onchange = function () {
         if (c.checked) { state.selected[c.dataset.select] = true; } else { delete state.selected[c.dataset.select]; }
@@ -734,9 +972,7 @@
         });
     };
 
-    ["guestsState", "guestsUnowned", "guestsFilter"].forEach(function (id) {
-      el(id).addEventListener("input", function () { renderGuests(state.guests, state.guestsShowAll); });
-    });
+    el("guestsUnowned").addEventListener("input", function () { renderGuests(state.guests, state.guestsShowAll); });
   }
 
   /* ---------------- acting on one collaborator ---------------- */
@@ -858,18 +1094,61 @@
       fact("Invited", g.invitedAt ? relativeIso(g.invitedAt) : "") +
       fact("Extended", g.renewCount ? g.renewCount + " time(s)" : "");
 
+    // Actions first. They are why somebody opened this, and putting them under a
+    // list that grows with every share meant scrolling past everything a guest
+    // can reach to find the button that ends their access.
     var body =
       '<p><span class="pill ' + stateClass(g.state) + '">' + esc(g.state) + "</span> " +
       '<span class="small muted">' + esc(g.statusLabel) + "</span></p>" +
+      renderActionSection() +
       (g.reason ? '<h3>Why they are here</h3><p>' + esc(g.reason) + "</p>" : "") +
       "<h3>The details</h3>" + '<div class="facts">' + facts + "</div>" +
-      renderAccessSection() +
-      renderActionSection();
+      renderAccessSection();
 
     el("gdBody").innerHTML = body;
     el("gdBody").querySelectorAll("[data-action]").forEach(function (b) {
       b.onclick = function () { renderGuestAction(b.dataset.action); };
     });
+    el("gdBody").querySelectorAll("[data-unshare]").forEach(function (b) {
+      b.onclick = function () { unshareItem(b.dataset.unshare, b.dataset.what); };
+    });
+    if (el("gdShare")) {
+      el("gdShare").onclick = function () {
+        var who = { id: g.id, email: g.email, displayName: g.displayName };
+        closeGuest();
+        startShare("files", who);
+      };
+    }
+  }
+
+  function unshareItem(itemId, what) {
+    if (!state.drawer) { return; }
+    var guest = state.drawer.guest;
+    var buttons = el("gdBody").querySelectorAll("[data-unshare]");
+    buttons.forEach(function (b) { b.disabled = true; });
+    api("/guests/" + encodeURIComponent(guest.id) + "/action", "POST", { action: "unshare", itemId: itemId })
+      .then(function (data) {
+        toast(data.message || (what + " is no longer shared."), "ok");
+        // Re-read rather than splice the row out locally: the API is the one
+        // that knows whether the record went, and it also drops entries whose
+        // access had already been removed elsewhere.
+        return api("/guests?id=" + encodeURIComponent(guest.id)).then(function (fresh) {
+          if (!state.drawer || state.drawer.guest.id !== guest.id) { return; }
+          state.drawer.guest = fresh.guest || guest;
+          renderGuestOverview();
+        });
+      })
+      .catch(function (e) {
+        buttons.forEach(function (b) { b.disabled = false; });
+        var host = el("gdUnshareError");
+        if (host) {
+          host.innerHTML = errorHtml(e);
+          host.hidden = false;
+          wireCopyButtons(host);
+          host.scrollIntoView({ block: "nearest" });
+        }
+        else { toast(e.message, "bad"); }
+      });
   }
 
   function relativeIso(iso) {
@@ -886,26 +1165,56 @@
 
     if (d.loading) { return '<h3>What they can reach</h3><p class="row small muted"><span class="spinner"></span> Looking...</p>'; }
     if (d.loadError) { return '<h3>What they can reach</h3><p class="status bad">' + esc(d.loadError) + "</p>"; }
+
+    // Sharing from here starts with this person already chosen. Not offered for
+    // somebody whose access has ended: the grant would work and be unusable.
+    var caps = (state.me && state.me.capabilities) || {};
+    var live = ["active", "expiring", "pending"].indexOf(d.guest.state) >= 0;
+    var shareButton = (live && (truthy(caps.shareFiles) || truthy(caps.shareFolders)))
+      ? '<p style="margin-top:10px"><button class="btn small" id="gdShare">' +
+      (items && items.length ? "Share something else" : "Share something now") + "</button></p>"
+      : "";
+
     if (!items || !items.length) {
       return "<h3>What they can reach</h3>" +
-        '<p class="small muted">Nothing has been shared with them through Collaborate. Anything shared with them directly in SharePoint or Teams does not appear here.</p>';
+        '<p class="small muted">Nothing has been shared with them through Collaborate. Anything shared with them directly in SharePoint or Teams does not appear here.</p>' +
+        shareButton;
     }
 
+    var anyRedacted = false;
     var rows = items.map(function (it) {
+      if (it.redacted) { anyRedacted = true; }
       var url = safeUrl(it.webUrl);
       var name = url
         ? '<a href="' + esc(url) + '" target="_blank" rel="noopener noreferrer">' + esc(it.name) + " ↗</a>"
         : esc(it.name);
-      var meta = [it.kindLabel, it.roleLabel, it.sharedAtLabel ? "shared " + it.sharedAtLabel : "", it.sharedBy]
+      // Who shared it, always and first: with two colleagues sharing with the
+      // same person, that is the fact that makes the rest of the line mean
+      // anything.
+      var by = it.sharedByYou ? "You" : (it.sharedBy || "somebody else");
+      var meta = [by, it.kindLabel, it.roleLabel, it.sharedAtLabel ? "shared " + it.sharedAtLabel : ""]
         .filter(function (m) { return m; }).join(" · ");
+
+      var action = "";
+      if (it.canRevoke) {
+        action = '<button class="btn small ghost" data-unshare="' + esc(it.id) + '" data-what="' + esc(it.name) + '">Unshare</button>';
+      } else if (it.revokeBlockedReason) {
+        action = '<span class="small muted" title="' + esc(it.revokeBlockedReason) + '">-</span>';
+      }
+
       return '<div class="access-row"><span class="icon-cell">' + (ICONS[it.icon] || ICONS.file) + "</span>" +
-        '<span class="grow"><strong>' + name + "</strong><br>" +
-        '<span class="small muted">' + esc(meta) + "</span></span></div>";
+        '<span class="grow"><strong' + (it.redacted ? ' class="muted"' : "") + ">" + name + "</strong><br>" +
+        '<span class="small muted">' + esc(meta) + "</span></span>" + action + "</div>";
     }).join("");
 
-    return "<h3>What they can reach</h3>" + '<div class="access-list">' + rows + "</div>" +
+    return "<h3>What they can reach</h3>" + '<div id="gdUnshareError" hidden></div>' +
+      '<div class="access-list">' + rows + "</div>" +
+      (anyRedacted
+        ? '<p class="small muted" style="margin-top:8px">Items a colleague shared are not named. Ask whoever shared it.</p>'
+        : "") +
       '<p class="small muted" style="margin-top:8px">What Collaborate granted, newest first, up to the last 50. ' +
-      "Access given to them directly in SharePoint or Teams is not listed: it was never ours to see.</p>";
+      "Access given to them directly through SharePoint or Teams is not listed.</p>" +
+      shareButton;
   }
 
   // One obvious next step, the rest quieter, and anything unavailable said in a
@@ -1242,13 +1551,23 @@
 
   var SHARE_STEPS = ["What", "Who", "Confirm"];
 
-  function startShare(mode) {
+  // recipient, when given, is a collaborator already chosen elsewhere (the
+  // drawer's Share button). The "who" step is then skipped entirely.
+  function startShare(mode, recipient) {
     clearHomeResult();
-    state.share = { mode: mode, step: 0, target: null, recipient: null, newGuest: null, crumb: [], pane: mode === "teams" ? "teams" : "recent" };
+    state.share = {
+      mode: mode, step: 0, target: null, recipient: recipient || null, newGuest: null,
+      lockedRecipient: !!recipient, crumb: [], pane: mode === "teams" ? "teams" : "recent"
+    };
     el("shPerson").value = "";
     el("shMatches").innerHTML = "";
     el("shNewGuest").innerHTML = "";
     el("shMessage").value = "";
+    el("shCrumb").innerHTML = "";
+    el("shItems").innerHTML = "";
+    el("shError").hidden = true;
+    el("shError").innerHTML = "";
+    state.share.siteId = ""; state.share.siteUrl = "";
     setStatus("shWhoStatus", "");
     setStatus("shStatus", "");
     showView("share");
@@ -1257,8 +1576,12 @@
 
   function renderShareStep() {
     var s = state.share;
-    el("shSteps").innerHTML = SHARE_STEPS.map(function (label, i) {
-      return '<span class="step' + (i === s.step ? " active" : "") + '">' + (i + 1) + ". " + esc(label) + "</span>";
+    // With the person already chosen there are two steps, not three, and the
+    // indicator should say so rather than showing a step nobody will see.
+    var labels = s.lockedRecipient ? ["What", "Confirm"] : SHARE_STEPS;
+    var shown = s.lockedRecipient ? (s.step === 0 ? 0 : 1) : s.step;
+    el("shSteps").innerHTML = labels.map(function (label, i) {
+      return '<span class="step' + (i === shown ? " active" : "") + '">' + (i + 1) + ". " + esc(label) + "</span>";
     }).join(" ");
     el("shPick").hidden = s.step !== 0;
     el("shWho").hidden = s.step !== 1;
@@ -1323,26 +1646,61 @@
     });
     setStatus("shPickStatus", "Loading...");
     el("shItems").innerHTML = "";
+    el("shCrumb").innerHTML = "";
+    el("shError").hidden = true;
     return api("/browse" + query).then(function (data) {
       setStatus("shPickStatus", "");
       renderPickItems(data.items || [], data.emptyReason);
     }).catch(function (e) {
-      setStatus("shPickStatus", e.message, "bad");
+      setStatus("shPickStatus", "");
+      el("shItems").innerHTML = errorHtml(e) +
+        '<p><button type="button" class="btn small ghost" id="shPickBackToSites">Back to the site list</button></p>';
+      wireCopyButtons(el("shItems"));
+      el("shPickBackToSites").onclick = function () {
+        state.share.crumb = [];
+        renderPanes();
+        loadPane("sites");
+      };
     });
   }
 
   function renderPickItems(items, emptyReason) {
     var host = el("shItems");
     renderCrumb();
+
+    // A site known to refuse external sharing, either because SharePoint said so
+    // when the list was built or because it refused a share earlier. Said before
+    // anything is picked, rather than after a guest has been created for it.
+    var s = state.share;
+    var known = s.siteUrl && siteSettingsCache()[s.siteUrl];
+    if (known && known.known && !truthy(known.canShareExternally) && s.siteId && !blockedSites()[s.siteId]) {
+      blockedSites()[s.siteId] = known.reason || "SharePoint does not allow external sharing here.";
+    }
+    var blocked = s.siteId && blockedSites()[s.siteId];
+    if (blocked) {
+      host.innerHTML = '<div class="banner error"><div><div class="title">This site does not allow external sharing</div>' +
+        '<div class="small">' + esc(blocked) + " Nothing here can be shared outside the company. " +
+        "The person who owns the site can change that in SharePoint.</div>" +
+        '<div class="row" style="margin-top:10px"><button type="button" class="btn small" id="shPickLeaveSite">Choose somewhere else</button>' +
+        '<button type="button" class="btn small ghost" id="shPickAnyway">Look anyway</button></div></div></div>';
+      el("shPickLeaveSite").onclick = function () {
+        s.crumb = []; s.siteId = ""; renderPanes(); loadPane("sites");
+      };
+      el("shPickAnyway").onclick = function () { delete blockedSites()[s.siteId]; renderPickItems(items, emptyReason); };
+      return;
+    }
     if (!items.length) {
       host.innerHTML = '<p class="muted small">' + esc(emptyReason || "Nothing here.") + "</p>";
       return;
     }
+    // A note that applies to a list that is not empty: sites dropped for no
+    // longer existing, for instance.
+    var note = emptyReason ? '<p class="small muted">' + esc(emptyReason) + "</p>" : "";
     // A folder is both a place to go into and a thing that can be shared, so it
     // gets two separate controls rather than one ambiguous click. The row is a
     // container, never a button, so the controls inside stay real buttons and
     // keyboard navigation works.
-    host.innerHTML = items.map(function (it, i) {
+    host.innerHTML = note + items.map(function (it, i) {
       var openable = it.kind === "folder" || it.kind === "site" || it.kind === "drive";
       // What it is, where it lives, and when it was last touched. A column of
       // twenty file names is not enough to pick from: half of them are called
@@ -1352,6 +1710,9 @@
         (openable || it.canShare ? "" : " disabled") + ">" +
         '<span class="icon-cell">' + (ICONS[it.icon] || ICONS.file) + "</span>" +
         "<span><strong>" + esc(it.name) + "</strong>" +
+        // Filled in when SharePoint answers for this site, which is after the
+        // list is already usable.
+        (it.kind === "site" ? '<span data-site-note="' + esc(it.webUrl) + '"></span>' : "") +
         (facts.length ? '<br><span class="small muted">' + esc(facts.join(" · ")) + "</span>" : "") +
         "</span></button>";
       // Opening the real thing in a new tab is how somebody checks they picked
@@ -1363,16 +1724,20 @@
         peek = '<a class="pick-peek" href="' + esc(url) + '" target="_blank" rel="noopener noreferrer" ' +
           'title="Open in a new tab">Open ↗</a>';
       }
+      // A file used to have no button at all: clicking the row worked, but a
+      // folder next to it showing "Share this folder" made that look deliberate.
       var action = "";
       if (it.canShare && openable) {
         action = '<button type="button" class="btn small ghost" data-share="' + i + '">Share this folder</button>';
-      } else if (!it.canShare && !openable) {
+      } else if (it.canShare) {
+        action = '<button type="button" class="btn small ghost" data-share="' + i + '">Share this file</button>';
+      } else if (!openable) {
         action = '<span class="small muted">' + esc(it.shareBlockedReason || "not available") + "</span>";
-      } else if (openable) {
-        action = '<span class="small muted">Choose</span>';
       }
       return '<div class="pick-row">' + main + peek + action + "</div>";
     }).join("");
+
+    loadSiteSettings(items);
 
     host.querySelectorAll("[data-open]").forEach(function (b) {
       b.onclick = function () {
@@ -1384,13 +1749,70 @@
     host.querySelectorAll("[data-share]").forEach(function (b) {
       b.onclick = function () {
         var it = items[Number(b.dataset.share)];
-        chooseTarget({ kind: "folder", driveId: it.driveId, itemId: it.id, name: it.name, webUrl: it.webUrl });
+        var kind = (it.kind === "folder" || it.kind === "site" || it.kind === "drive") ? "folder" : "file";
+        chooseTarget({ kind: kind, driveId: it.driveId, itemId: it.id, name: it.name, webUrl: it.webUrl });
       };
     });
   }
 
+  /* --- what SharePoint says about a site ---
+     Read lazily, one request per site, after the list is already on screen. The
+     list must never wait for this: a tenant with thirty followed sites would
+     take thirty round trips to show anything. */
+
+  function siteSettingsCache() {
+    if (!state.siteSettings) { state.siteSettings = {}; }
+    return state.siteSettings;
+  }
+
+  function loadSiteSettings(items) {
+    var cache = siteSettingsCache();
+    var pending = items.filter(function (it) {
+      return it.kind === "site" && safeUrl(it.webUrl) && !cache[it.webUrl];
+    });
+    if (!pending.length) { return; }
+
+    // Four at a time. Enough to feel instant on a normal list, few enough that a
+    // hundred sites do not open a hundred sockets.
+    var next = 0;
+    function pump() {
+      if (next >= pending.length) { return; }
+      var it = pending[next++];
+      api("/browse?pane=siteinfo&q=" + encodeURIComponent(it.webUrl))
+        .then(function (data) { cache[it.webUrl] = data.siteSettings || { known: false }; })
+        .catch(function () { cache[it.webUrl] = { known: false }; })
+        .then(function () { annotateSiteRow(it); pump(); });
+    }
+    for (var i = 0; i < 4; i++) { pump(); }
+  }
+
+  function annotateSiteRow(item) {
+    var info = siteSettingsCache()[item.webUrl];
+    var host = document.querySelector('[data-site-note="' + cssEscape(item.webUrl) + '"]');
+    if (!host || !info || !info.known) { return; }
+    if (truthy(info.canShareExternally)) { return; }
+    host.innerHTML = ' <span class="pill warn">no external sharing</span>';
+    host.title = info.reason || "";
+  }
+
+  // Attribute selectors need the value escaped; a SharePoint URL is full of
+  // characters CSS treats as syntax.
+  function cssEscape(v) {
+    return String(v).replace(/["\\]/g, "\\$&");
+  }
+
+  // Sites that have already refused an external share, for this session.
+  // SharePoint's per-site external sharing setting is not readable through the
+  // permissions this tool holds, so the earliest we can know is the first
+  // refusal. After that, nobody should have to find out twice.
+  function blockedSites() {
+    if (!state.blockedSites) { state.blockedSites = {}; }
+    return state.blockedSites;
+  }
+
   function openContainer(entry, isCrumb) {
     var s = state.share;
+    if (entry.kind === "site") { s.siteId = entry.id; s.siteName = entry.name; s.siteUrl = entry.webUrl; }
     if (!isCrumb) { s.crumb.push(entry); }
     var extra = entry.kind === "site"
       ? { siteId: entry.id }
@@ -1429,7 +1851,7 @@
 
   function chooseTarget(target) {
     state.share.target = target;
-    state.share.step = 1;
+    state.share.step = state.share.lockedRecipient ? 2 : 1;
     renderShareStep();
   }
 
@@ -1551,7 +1973,9 @@
       message: el("shMessage").value.trim()
     };
     if (s.newGuest) { body.newGuest = s.newGuest; } else { body.guestId = s.recipient.id; }
+    if (s.siteId) { body.target = Object.assign({}, s.target, { siteId: s.siteId }); }
 
+    el("shError").hidden = true;
     api("/share", "POST", body).then(function (data) {
       var lines = [];
       if (s.target && s.target.name) { lines.push(s.target.name); }
@@ -1563,7 +1987,16 @@
         });
     }).catch(function (e) {
       el("shGo").disabled = false;
-      setStatus("shStatus", e.message, "bad");
+      setStatus("shStatus", "");
+      el("shError").innerHTML = errorHtml(e);
+      el("shError").hidden = false;
+      wireCopyButtons(el("shError"));
+      // Remember a site that refuses external sharing, so the next visit says so
+      // before anything is picked.
+      if (e.data && e.data.sitePolicy) {
+        var id = e.data.siteId || s.siteId;
+        if (id) { blockedSites()[id] = "SharePoint refused a share from here on " + new Date().toLocaleDateString() + "."; }
+      }
       // The guest exists but the share did not happen. Offer the share alone,
       // so nobody is tempted to start again and invite the same person twice.
       if (e.data && e.data.guestCreated && e.data.guest && e.data.guest.id) {
@@ -1578,6 +2011,9 @@
   function wireShare() {
     el("shBack").onclick = function () {
       var s = state.share;
+      // Back from the confirmation returns to the picker when the person was
+      // fixed on the way in: there is no "who" step to go back to.
+      if (s.step === 2 && s.lockedRecipient) { s.step = 0; renderShareStep(); return; }
       if (s.step > 0) { s.step -= 1; renderShareStep(); }
     };
     el("shGo").onclick = doShare;

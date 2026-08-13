@@ -332,7 +332,11 @@ function Get-CBGuestView {
         # What the guest can reach. Off for lists: a tenant with a thousand
         # guests and fifty items each would send several megabytes to render a
         # table that shows none of it.
-        [switch]$IncludeShared
+        [switch]$IncludeShared,
+        # Who is looking, so the shared-item list can be redacted for them. Two
+        # colleagues can share with the same guest, and a document name is
+        # itself information.
+        $Viewer
     )
     if (-not $Settings) { $Settings = Get-CBSettings }
     $Now = ConvertTo-CBUtcMoment -Value $Now
@@ -381,7 +385,10 @@ function Get-CBGuestView {
         }
         if ($view.orphaned) { $view.owner.id = ''; $view.owner.displayName = 'nobody'; $view.owner.email = '' }
     }
-    if ($IncludeShared) { $view.sharedItems = @(Get-CBSharedItemView -Json "$($Row.SharedItems)" -Now $Now) }
+    if ($IncludeShared) {
+        $view.sharedItems = @(Get-CBSharedItemView -Json "$($Row.SharedItems)" -Now $Now `
+                -ViewerUpn "$($Viewer.Upn)" -ViewerIsAdmin:([bool]$Viewer.IsAdmin))
+    }
     return $view
 }
 

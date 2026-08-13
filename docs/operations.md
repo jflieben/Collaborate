@@ -149,6 +149,23 @@ shows administrators a banner. It emails the service desk once per version.
 **Collaborate never updates itself.**. Re-run the deployment, or
 `Update-Collaborate.ps1`, when you are ready.
 
+## Network access, and not locking your employees out
+
+The portal and the API are restricted to the addresses you allow. The public
+welcome page is public: guests reach it from anywhere.
+
+The deploy helps with ip whitelisting:
+
+- Outside Cloud Shell it detects your current public address
+- In **Azure Cloud Shell** it lists the addresses **Entra has seen you sign in from**, grouped and most recent first, so you can recognise the corporate egress instead of
+  guessing. That needs an Entra ID P1 or P2 licence and permission to read the
+  sign-in logs; without it the deploy falls back to pointing you at
+  `ifconfig.me`.
+- `-AllowedIp` skips the prompt entirely
+- If nothing can be determined, the lockdown is **skipped with a warning**
+
+Enterprises will prefer to use WAF / VPN / Private Networking, which can easily be configured on the deployed resources by any Azure Engineer. We do not provide documentation for this (too many different ways to set it up).
+
 ## When something goes wrong
 
 | Symptom | Where to look |

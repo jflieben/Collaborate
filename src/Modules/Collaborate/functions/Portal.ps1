@@ -104,6 +104,10 @@ function Get-CBMePayload {
         # than of the user, and the client is told rather than left to work out
         # why a column is empty.
         signInData    = (Get-CBSignInDataPayload)
+        # Tenant-wide SharePoint sharing. Shown so nobody walks the whole picker
+        # to be refused at the end. Per-site blocks are not readable through
+        # Graph and still only surface when a share is attempted.
+        sharingPolicy = (Get-CBSharingPolicyPayload -Settings $Settings)
         setupComplete = [bool]$Settings.setupComplete
         simulation    = [bool]$Settings.dryRun
         banners       = @(Get-CBPortalBanner -Settings $Settings -Caller $Caller)
@@ -184,6 +188,31 @@ function Get-CBAdminAccessPayload {
         Write-Warning "Could not read the administrator assignments: $($_.Exception.Message)"
         $empty.error = "The administrator assignments could not be read: $($_.Exception.Message)"
         return $empty
+    }
+}
+
+function Get-CBSharingPolicyPayload {
+    <#
+    .SYNOPSIS
+        What SharePoint's tenant settings mean for the sharing cards.
+    .OUTPUTS
+        @{ known; allowsExternal; capability; note }
+    #>
+    [CmdletBinding()] param($Settings)
+    if (-not $Settings) { $Settings = Get-CBSettings }
+    if (-not $Settings.sharing.files -and -not $Settings.sharing.folders) {
+        return [ordered]@{ known = $false; allowsExternal = $true; capability = ''; note = '' }
+    }
+    $policy = @{ Known = $false; AllowsExternal = $true; Capability = '' }
+    try { $policy = Get-CBTenantSharingPolicy } catch { Write-Warning "Could not read the sharing policy: $($_.Exception.Message)" }
+    return [ordered]@{
+        known          = [bool]$policy.Known
+        allowsExternal = [bool]$policy.AllowsExternal
+        capability     = "$($policy.Capability)"
+        note           = $(if ($policy.Known -and -not $policy.AllowsExternal) {
+                'External sharing is switched off for the whole tenant in SharePoint, so files and folders cannot be shared outside the company. A SharePoint administrator sets this.'
+            }
+            else { '' })
     }
 }
 

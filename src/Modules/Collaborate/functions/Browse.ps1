@@ -10,7 +10,7 @@
 # shape, so the browser-side picker stays dumb and one component renders recent
 # files, a document library and a search result identically.
 
-$script:CBBrowsePanes = @('recent', 'mydrive', 'sites', 'children', 'search')
+$script:CBBrowsePanes = @('recent', 'mydrive', 'sites', 'children', 'search', 'siteinfo')
 
 function Get-CBBrowsePaneName { return $script:CBBrowsePanes }
 
@@ -282,6 +282,133 @@ function Get-CBRecentItem {
     return @{ Items = @($items); Reason = $reason }
 }
 
+function ConvertTo-CBSiteSettings {
+    <#
+    .SYNOPSIS
+        SharePoint's own answer about one site, as the portal renders it.
+    .DESCRIPTION
+        Pure, so the meaning of each flag is testable without a tenant.
+
+        What a normal user can read from a site's own REST API, and what they
+        cannot:
+
+          ShareByEmailEnabled   can this site share with a person by address at
+                                all. False is the site-level external sharing
+                                block, which is not exposed through Graph.
+          ShareByLinkEnabled    sharing links, which this tool never uses.
+          ReadOnly / WriteLocked  the site is locked; nothing can be granted.
+          Classification        whatever the tenant puts there, shown as-is.
+
+        SharingCapability, ArchiveStatus and RestrictedAccessControl are
+        properties of the tenant admin API (Get-SPOSite), which needs SharePoint
+        administrator rights. An employee has none, so those are not readable on
+        this path and are not guessed at. A locked or archived site fails the
+        read outright, which is itself the answer.
+    .OUTPUTS
+        @{ Known; CanShareExternally; Locked; Reason; Classification; Raw }
+    #>
+    [CmdletBinding()] param($Site)
+    $result = [ordered]@{
+        Known = $false; CanShareExternally = $true; Locked = $false
+        Reason = ''; Classification = ''
+    }
+    if (-not $Site) { return $result }
+    $result.Known = $true
+    $result.Classification = "$($Site.Classification)"
+
+    $locked = ($Site.PSObject.Properties['ReadOnly'] -and $Site.ReadOnly) -or
+              ($Site.PSObject.Properties['WriteLocked'] -and $Site.WriteLocked)
+    if ($locked) {
+        $result.Locked = $true
+        $result.CanShareExternally = $false
+        $result.Reason = 'This site is read-only or locked, so nothing in it can be shared.'
+        return $result
+    }
+
+    # Only decided when SharePoint actually said. A property that is missing
+    # means the API did not answer for it, not that it is false.
+    if ($Site.PSObject.Properties['ShareByEmailEnabled'] -and -not $Site.ShareByEmailEnabled) {
+        $result.CanShareExternally = $false
+        $result.Reason = 'This site does not allow sharing with people outside the company. The person who owns the site can change that in SharePoint.'
+    }
+    return $result
+}
+
+function Get-CBSiteSettings {
+    <#
+    .SYNOPSIS
+        Reads one site's settings from SharePoint, as the signed-in user.
+    .DESCRIPTION
+        Fails soft: an unreadable site (the scope not consented yet, an archived
+        or locked site, SharePoint having a bad minute) returns Known = false and
+        everything carries on as it did before this existed.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$SiteUrl)
+    try {
+        $select = 'Id,Url,ReadOnly,WriteLocked,ShareByEmailEnabled,ShareByLinkEnabled,Classification'
+        $site = Invoke-CBSharePointRest -Caller $Caller -SiteUrl $SiteUrl -Path "site?`$select=$select"
+        return (ConvertTo-CBSiteSettings -Site $site)
+    }
+    catch {
+        $detail = "$($_.Exception.Message)"
+        Write-Warning "Could not read the settings of ${SiteUrl}: $detail"
+        $out = ConvertTo-CBSiteSettings -Site $null
+        # A site nobody can read at all is usually locked or archived, which is
+        # worth saying rather than showing nothing.
+        if ($detail -match 'HTTP 403|HTTP 404|locked|archiv') {
+            $out.Reason = 'SharePoint would not answer for this site. It may be locked, archived, or not readable by you.'
+        }
+        return $out
+    }
+}
+
+function Select-CBLiveSite {
+    <#
+    .SYNOPSIS
+        Drops followed sites that no longer exist.
+    .DESCRIPTION
+        /me/followedSites keeps returning a site after it has been deleted:
+        SharePoint does not prune the follow list. They look real, 404 when
+        opened and 404 in the browser, and there is no flag on the entry to tell
+        them apart.
+
+        Checked in one $batch request (20 per batch, capped at two) rather than a
+        call per site. A batch that fails for any other reason returns the list
+        untouched: a broken check must not empty somebody's site list.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)]$Caller, $Sites, [int]$MaxChecked = 40)
+    $list = @($Sites | Where-Object { $_ -and "$($_.id)" })
+    if ($list.Count -eq 0) { return @() }
+    if ($list.Count -gt $MaxChecked) { return @($list) }
+
+    $alive = [System.Collections.Generic.List[object]]::new()
+    $index = 0
+    while ($index -lt $list.Count) {
+        $chunk = @($list[$index..([Math]::Min($index + 19, $list.Count - 1))])
+        $requests = @()
+        for ($i = 0; $i -lt $chunk.Count; $i++) {
+            $requests += @{ id = "$i"; method = 'GET'; url = "/sites/$($chunk[$i].id)?`$select=id" }
+        }
+        try {
+            $response = Invoke-CBGraphAsUser -Caller $Caller -Method Post -Uri '/$batch' -Body @{ requests = $requests }
+            $status = @{}
+            foreach ($r in @($response.responses)) { $status["$($r.id)"] = [int]$r.status }
+            for ($i = 0; $i -lt $chunk.Count; $i++) {
+                $code = $status["$i"]
+                # Anything but a definite "gone" is kept: a throttled or
+                # unreadable check is not evidence the site is missing.
+                if ($null -eq $code -or $code -ne 404) { $alive.Add($chunk[$i]) }
+            }
+        }
+        catch {
+            Write-Warning "Could not check which followed sites still exist: $($_.Exception.Message)"
+            foreach ($s in $chunk) { $alive.Add($s) }
+        }
+        $index += 20
+    }
+    return @($alive)
+}
+
 function ConvertTo-CBBrowseSite {
     <#
     .SYNOPSIS
@@ -356,7 +483,7 @@ function Get-CBBrowsePane {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$Caller,
-        [Parameter(Mandatory)][ValidateSet('recent', 'mydrive', 'sites', 'children', 'search')][string]$Pane,
+        [Parameter(Mandatory)][ValidateSet('recent', 'mydrive', 'sites', 'children', 'search', 'siteinfo')][string]$Pane,
         [string]$DriveId,
         [string]$ItemId,
         [string]$SiteId,
@@ -390,7 +517,13 @@ function Get-CBBrowsePane {
                 # they actually work in, and it needs no search term.
                 try {
                     $r = Invoke-CBGraphAsUser -Caller $Caller -Uri "/me/followedSites?`$top=$Top"
-                    foreach ($s in @($r.value)) { $items.Add((ConvertTo-CBBrowseSite -Site $s)) }
+                    $followed = @($r.value)
+                    $alive = Select-CBLiveSite -Caller $Caller -Sites $followed
+                    foreach ($s in $alive) { $items.Add((ConvertTo-CBBrowseSite -Site $s)) }
+                    $dropped = $followed.Count - $alive.Count
+                    if ($dropped -gt 0) {
+                        $emptyReason = "$dropped site(s) you follow no longer exist and are not listed."
+                    }
                 }
                 catch { Write-Warning "Could not read followed sites: $($_.Exception.Message)" }
             }
@@ -425,6 +558,16 @@ function Get-CBBrowsePane {
                 else { '/drives/' + $drive + '/root/children' }
                 $r = Invoke-CBGraphAsUser -Caller $Caller -Uri "$path`?$select&`$top=$Top"
                 foreach ($i in @($r.value)) { $items.Add((ConvertTo-CBBrowseItem -Item $i -FallbackDriveId $DriveId)) }
+            }
+        }
+        'siteinfo' {
+            # Not a list of things: one site's own settings, read from SharePoint
+            # because Graph does not carry them. Returned through the same pane
+            # shape so the API surface stays one endpoint.
+            if (-not $Query) { throw 'No site URL was given.' }
+            return [pscustomobject]@{
+                Items = @(); Pane = $Pane; Breadcrumb = @(); Next = ''; EmptyReason = ''
+                SiteSettings = (Get-CBSiteSettings -Caller $Caller -SiteUrl $Query)
             }
         }
         'search' {

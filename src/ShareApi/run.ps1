@@ -67,6 +67,11 @@ try {
             guestCreated = [bool]$result.GuestCreated
             guest        = $result.Guest
             retryable    = [bool]$result.Retryable
+            detail       = "$($result.Detail)"
+            # The site itself refuses external sharing. The portal remembers it
+            # for the session and warns before somebody browses it again.
+            sitePolicy   = [bool]$result.SitePolicy
+            siteId       = "$($result.SiteId)"
             verdict      = $(if ($result.Verdict) { $result.Verdict.Verdict } else { '' })
             owner        = $(if ($result.Verdict) { $result.Verdict.Owner } else { $null })
         }
@@ -85,7 +90,11 @@ try {
     }
 }
 catch {
-    Write-CBHeartbeatSampled -Name 'ShareApi' -Status error -ErrorMessage $_.Exception.Message
-    Write-Error "ShareApi failed: $($_.Exception.Message)"
-    Send-Json -Status 500 -Object @{ error = $_.Exception.Message }
+    $detail = "$($_.Exception.Message)"
+    Write-CBHeartbeatSampled -Name 'ShareApi' -Status error -ErrorMessage $detail
+    Write-Error "ShareApi failed: $detail"
+    Send-Json -Status 500 -Object @{
+        error  = 'The share could not be completed. This is not something you did wrong; the details below are what support needs.'
+        detail = $detail
+    }
 }

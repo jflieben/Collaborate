@@ -165,6 +165,61 @@ function Test-AzureCloudShell {
     )
 }
 
+function Show-CBSignInIpHint {
+    <#
+    .SYNOPSIS
+        Shows the addresses the operator has recently signed in from, so they can
+        recognise which one to allow.
+    .DESCRIPTION
+        Guessing a public IP is the step people get wrong, and getting it wrong
+        here locks somebody out of the thing they just installed. Entra already
+        knows the answer: it recorded the address every time this account signed
+        in.
+
+        Distinct addresses, most recent first, rather than the raw log. Five rows
+        of the same address answers nothing, and what the operator is trying to
+        work out is "which addresses do we come from", which is a set.
+
+        Best effort throughout. Sign-in logs need an Entra ID P1 or P2 licence and
+        a role that may read them, and the Azure CLI's own token may not carry the
+        scope. None of that is worth failing a deployment over, so every path ends
+        in a hint rather than an error.
+    #>
+    [CmdletBinding()] param([int]$Sample = 25)
+    Write-Host 'Looking up the addresses you have recently signed in from...'
+    try {
+        $me = Invoke-Az -AzArgs @('rest', '--method', 'GET', '--url', 'https://graph.microsoft.com/v1.0/me') -AllowFail | Out-String | ConvertFrom-Json
+        $upn = "$($me.userPrincipalName)"
+        if ($upn) {
+            $filter = [Uri]::EscapeDataString("userPrincipalName eq '$($upn.Replace("'", "''"))'")
+            $url = "https://graph.microsoft.com/v1.0/auditLogs/signIns?`$top=$Sample&`$filter=$filter"
+            $resp = Invoke-Az -AzArgs @('rest', '--method', 'GET', '--url', $url) -AllowFail | Out-String | ConvertFrom-Json
+            $rows = @($resp.value | Where-Object { "$($_.ipAddress)" })
+            if ($rows.Count) {
+                $summary = $rows | Group-Object -Property ipAddress | ForEach-Object {
+                    [pscustomobject]@{
+                        Address   = $_.Name
+                        SignIns   = $_.Count
+                        LastSeen  = ("$(($_.Group | Sort-Object createdDateTime -Descending | Select-Object -First 1).createdDateTime)" -split 'T')[0]
+                        LastUsedFor = "$(($_.Group | Sort-Object createdDateTime -Descending | Select-Object -First 1).appDisplayName)"
+                    }
+                } | Sort-Object -Property LastSeen -Descending
+
+                Write-Host ''
+                Write-Host 'You have signed in from these addresses:' -ForegroundColor Cyan
+                ($summary | Format-Table -AutoSize | Out-String).TrimEnd() | Write-Host
+                Write-Host 'One of these is almost certainly what you want. If your employees sign in through the same' -ForegroundColor Cyan
+                Write-Host 'corporate egress, allow that range rather than a single address.' -ForegroundColor Cyan
+                Write-Host ''
+                return
+            }
+        }
+    }
+    catch { }
+    Write-Host '(Could not read your sign-in history: it needs an Entra ID P1 or P2 licence and permission to read the'
+    Write-Host ' sign-in logs. Find the address from the network your employees use, e.g. https://ifconfig.me.)'
+}
+
 # Single source of truth for the version: the VERSION file at the repo root.
 $moduleVersion = '0.1.0'
 try {
@@ -266,7 +321,7 @@ try {
         Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force -AllowClobber
     }
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
-    Write-Host 'Connecting to Exchange Online (a sign-in window will open)...'
+    Write-Host 'Connecting to Exchange Online (a sign-in window may open)...'
     Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
     $mbxSmtp = (Get-Mailbox -Identity $SenderUpn -ErrorAction Stop).PrimarySmtpAddress
     Write-Host "Sender mailbox verified: $mbxSmtp"
@@ -663,13 +718,30 @@ else {
     $detectedIp = $null
     if (Test-AzureCloudShell) {
         Write-Host 'Azure Cloud Shell detected: the auto-detected address is an Azure one, not yours, so it will NOT be used.' -ForegroundColor Yellow
-        if (-not $AllowedIp) {
+        if (-not $AllowedIp -and [Environment]::UserInteractive) {
+            Show-CBSignInIpHint
             Write-Host 'Employees use this portal, so allow the ranges they browse from (your corporate egress), not only your own address.'
             $entered = (Read-Host 'IP addresses or CIDR ranges to allow, comma separated (blank = skip lockdown for now)').Trim()
             if ($entered) { $AllowedIp = @($entered -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
         }
     }
-    else { $detectedIp = Get-MyPublicIp }
+    else {
+        $detectedIp = Get-MyPublicIp
+        # Detecting an address is not the same as knowing it is the right one.
+        # This portal is used by every employee, not only by whoever ran the
+        # deploy, and locking it to the deployer's home address is a failure
+        # nobody notices until the first person complains they cannot reach it.
+        # So when no range was given, show what Entra has seen and offer the
+        # choice while it is still cheap to make.
+        # Guarded on an interactive host: an unattended run must keep working, and
+        # there it falls back to the detected address exactly as it did before.
+        if (-not $AllowedIp -and [Environment]::UserInteractive) {
+            if ($detectedIp) { Write-Host "Detected your current address: $detectedIp" }
+            Show-CBSignInIpHint
+            $entered = (Read-Host "IP addresses or CIDR ranges to allow, comma separated (blank = just $detectedIp)").Trim()
+            if ($entered) { $AllowedIp = @($entered -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+        }
+    }
     $allowedIps = @(@($AllowedIp) + @($detectedIp) | Where-Object { $_ } | Select-Object -Unique)
 
     if ($allowedIps.Count -eq 0) {

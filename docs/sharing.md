@@ -91,6 +91,25 @@ A guest is added to a Team **after they are invited but before they accept**. Th
 account exists from the moment the invitation is created, which is what lets
 "invite and add to the Team" be one action for the person doing it.
 
+## When SharePoint will not allow it
+
+**Tenant level** `SharePointTenantSettings.Read.All` on the
+managed identity reads `/admin/sharepoint/settings`, cached per worker. With
+external sharing switched off tenant-wide the sharing card is disabled and says
+why, and `Invoke-CBShareRequest` refuses.
+
+The same read gives the allowed/blocked domain lists, so a recipient SharePoint
+would reject is refused at the same point rather than after the invitation.
+
+**Site level** comes from SharePoint's own REST API on the site itself, read as
+the signed-in user with the delegated `AllSites.Read` scope. Graph does not expose this. 
+
+| Property | Read from | Notes |
+|---|---|---|
+| `ShareByEmailEnabled` | `/_api/site` as the user | The site-level external sharing block |
+| `ReadOnly`, `WriteLocked` | `/_api/site` as the user | A locked site: nothing can be granted |
+| `Classification` | `/_api/site` as the user | Shown as-is |
+
 ## When SharePoint says no
 
 Sharing can fail for policy reasons, and these errors
@@ -104,6 +123,35 @@ reach ordinary employees. `Get-CBShareFailureMessage` translates:
 | `itemNotFound` | That it has moved or been deleted since they picked it |
 
 Anything unrecognised is passed through.
+
+## Two people sharing with the same guest
+
+"What they can reach" is a list the viewer is not automatically entitled
+to read. **A document name is itself information** -- "Redundancy plan Q3.xlsx"
+tells you something whether or not you can open the file. So:
+
+| Who is looking | What they see |
+|---|---|
+| The person who shared it | Name, link, role, and an **Unshare** button |
+| Anybody else, including the owner | "A file shared by somebody else", with who shared it and when. No name, no link, no role |
+| An administrator | Every name, no links removed. Still no Unshare on other people's shares |
+
+**Team names are never redacted.** Its
+membership is probably visible to its members anyway
+
+The URL is dropped along with the name, because a SharePoint URL contains the
+file name.
+
+### Unsharing
+
+`POST /api/guests/{id}/action` with `unshare`, and it runs **as the person**,
+delegated. 
+
+Only the person who shared something can un-share it here, **administrators
+included**.
+
+A site that has since stopped allowing external people refuses the removal too.
+The record is dropped
 
 ## Switching it off
 

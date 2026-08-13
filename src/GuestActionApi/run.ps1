@@ -9,6 +9,7 @@ using namespace System.Net
 #   renew     extend access, bringing back a blocked or recently deleted account
 #   cancel    end access now, with the same grace period as a normal expiry
 #   transfer  hand the guest to a colleague, who takes over the reminders
+#   unshare   take back one thing YOU shared with them (delegated, as you)
 #   resend    issue a fresh invitation to somebody who has not accepted
 #
 # Every action except claim and ask goes through Test-CBGuestAccess first: the
@@ -95,6 +96,13 @@ try {
                 message   = "$($result.Message)"
                 simulated = [bool]$result.Simulated
             }
+        }
+        'unshare' {
+            $access = Test-CBGuestAccess -Caller $caller -GuestId $guestId
+            if (-not $access.Ok) { Send-Json -Status $access.Status -Object @{ error = $access.Error }; return }
+            $result = Remove-CBSharedAccess -Caller $caller -Row $access.Row -ItemKey "$($body.itemId)" -Settings $settings
+            if (-not $result.Ok) { Send-Json -Status $result.Status -Object @{ error = $result.Error }; return }
+            Send-Json -Status 200 -Object @{ message = "$($result.Message)" }
         }
         'resend' {
             $result = Update-CBGuestInvitation -Caller $caller -GuestId $guestId -Settings $settings
