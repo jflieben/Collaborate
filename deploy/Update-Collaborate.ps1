@@ -141,6 +141,12 @@ if ($appId -and $principalId) {
         $null = Set-CBFederatedCredential -AppObjectId $appObjId -PrincipalId $principalId -TenantId $tenantId
         $delegatedFailed = @(Update-CBDelegatedPermission -AppId $appId -AppObjectId $appObjId -ServicePrincipalId $spId)
     }
+    else {
+        # Skipping this silently is how a newly added scope looks reconciled and
+        # is not there: nothing in the output mentions it either way.
+        Write-Warning "Could not read the portal app registration ($appId) as this account, so DELEGATED permissions were not reconciled. Anything added in this release (sharing scopes) will not work until an account that can read it runs this again."
+        $delegatedFailed = @('delegated permissions were not checked at all')
+    }
 }
 else { Write-Warning 'Could not resolve the portal app registration; skipping delegated permission reconciliation.' }
 

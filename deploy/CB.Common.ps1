@@ -312,6 +312,11 @@ function Update-CBDelegatedPermission {
     $scopes = @($req.delegatedScopes)
     if ($scopes.Count -eq 0) { return $failed }
     Write-Host "Reconciling delegated permissions for application $AppId..."
+    # Named per resource, because "delegated permissions reconciled" does not
+    # tell anybody whether the one added in this release is among them.
+    foreach ($group in ($scopes | Group-Object -Property resource)) {
+        Write-Host "  $($group.Name): $((@($group.Group | ForEach-Object { $_.value })) -join ', ')"
+    }
 
     # Group the wanted scopes per resource, resolving each scope's id.
     $byResource = @{}
@@ -329,26 +334,37 @@ function Update-CBDelegatedPermission {
         $entry.Wanted.Add(@{ Value = $s.value; Id = $scope.id })
     }
 
+    # Declare every resource's permissions on the application object in ONE
+    # patch. Doing it per resource inside the loop below meant reading the
+    # application back between writes, and Graph does not guarantee that read
+    # sees the write before it: the second resource could then patch a list that
+    # no longer had the first, and which one survived depended on hashtable
+    # ordering. That is how a second resource can be reconciled every run and
+    # still not be there.
+    $active = @($byResource.Keys | Where-Object { $byResource[$_].Wanted.Count -gt 0 })
+    if ($active.Count -gt 0) {
+        $current = Invoke-CBGraphJson -Method GET -Uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId`?`$select=requiredResourceAccess" -AllowFail
+        $rra = @()
+        if ($current -and $current.requiredResourceAccess) {
+            $rra = @($current.requiredResourceAccess | Where-Object { $active -notcontains $_.resourceAppId })
+        }
+        foreach ($appIdKey in $active) {
+            $rra += @{
+                resourceAppId  = $appIdKey
+                resourceAccess = @($byResource[$appIdKey].Wanted | ForEach-Object { @{ id = $_.Id; type = 'Scope' } })
+            }
+        }
+        $patched = Invoke-CBGraphJson -Method PATCH -Uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId" -Body @{ requiredResourceAccess = $rra } -AllowFail
+        if ($null -eq $patched) { Write-Verbose "requiredResourceAccess PATCH returned no body (normal for a 204)." }
+    }
+
     foreach ($appIdKey in $byResource.Keys) {
         $entry = $byResource[$appIdKey]
         if ($entry.Wanted.Count -eq 0) { continue }
         $resourceSpId = $entry.Sp.id
         $wantedValues = @($entry.Wanted | ForEach-Object { $_.Value })
 
-        # 1. Declare the permissions on the application object (portal visibility).
-        $current = Invoke-CBGraphJson -Method GET -Uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId`?`$select=requiredResourceAccess" -AllowFail
-        $rra = @()
-        if ($current -and $current.requiredResourceAccess) {
-            $rra = @($current.requiredResourceAccess | Where-Object { $_.resourceAppId -ne $appIdKey })
-        }
-        $rra += @{
-            resourceAppId  = $appIdKey
-            resourceAccess = @($entry.Wanted | ForEach-Object { @{ id = $_.Id; type = 'Scope' } })
-        }
-        $patched = Invoke-CBGraphJson -Method PATCH -Uri "https://graph.microsoft.com/v1.0/applications/$AppObjectId" -Body @{ requiredResourceAccess = $rra } -AllowFail
-        if ($null -eq $patched) { Write-Verbose "requiredResourceAccess PATCH returned no body (normal for a 204)." }
-
-        # 2. The consent itself. Merge with anything already granted rather than
+        # The consent itself. Merge with anything already granted rather than
         #    replacing it, so a scope added by hand is never silently revoked.
         $enc = [Uri]::EscapeDataString("clientId eq '$ServicePrincipalId' and resourceId eq '$resourceSpId'")
         $existing = Invoke-CBGraphJson -Method GET -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=$enc" -AllowFail

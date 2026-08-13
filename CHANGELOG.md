@@ -4,6 +4,18 @@ All notable changes to Collaborate are documented here. The version is the singl
 source in `VERSION` (stamped into the module manifest, the `CB_VERSION` app
 setting, and the portal footer at deploy time).
 
+## 0.6.2
+### A delegated scope on a second resource could be reconciled and still missing
+
+- `requiredResourceAccess` was patched **once per resource**, reading the
+  application back between writes. Graph does not promise that read sees the
+  write, so the second resource could patch a list that no longer contained the
+  first, and which one survived depended on hashtable ordering. Built once and
+  patched once now.
+- `Update-Collaborate.ps1` **skipped delegated reconciliation silently** when it
+  could not read the app registration. It now says so and reports it as a
+  failure.
+
 ## 0.6.1
 ### Deploy: help choosing the address to allow
 

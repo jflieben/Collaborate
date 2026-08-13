@@ -229,6 +229,16 @@ Describe 'The installer and the deploy agree about the IP prompt' {
         $common | Should -Match 'function Test-AzureCloudShell'
         $deploy | Should -Not -Match 'function Show-CBSignInIpHint'
     }
+    It 'declares every resource on the app object in one patch' {
+        # Patching once per resource meant reading the application back between
+        # writes, and Graph does not promise that read sees the write. The second
+        # resource could then patch a list that no longer had the first, so a
+        # scope on a second resource could be reconciled every run and still not
+        # be there.
+        $fn = [regex]::Match($common, '(?s)function Update-CBDelegatedPermission.*?\n}').Value
+        ([regex]::Matches($fn, 'requiredResourceAccess = ')).Count | Should -Be 1
+        $fn | Should -Match 'active = @\(\$byResource\.Keys'
+    }
     It 'does not make the hint depend on the deploy script' {
         # install.ps1 dot-sources CB.Common on its own, without Invoke-Az.
         $hint = [regex]::Match($common, '(?s)function Show-CBSignInIpHint.*?\n}').Value
