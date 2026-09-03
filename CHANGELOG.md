@@ -5,6 +5,23 @@ source in `VERSION` (stamped into the module manifest, the `CB_VERSION` app
 setting, and the portal footer at deploy time).
 
 ## 0.7.0
+### Dutch
+
+- The whole portal is available in **Dutch**. English stays the source language
+  and doubles as the dictionary key, so an untranslated string renders as its
+  English sentence, never as a blank or an identifier.
+- **Administrators set the default** on Configuration; **anybody can override it
+  for themselves** from the picker at the top right, and that choice is stored
+  against their account so it follows them to another machine. Before either
+  exists, the browser's language decides.
+- Email bodies, welcome-page copy and branding are admin-editable free text and
+  stay as written.
+
+### A site that blocks sharing no longer hides that once you look past it
+
+- `blockedBanner` was referenced and never defined, so **the picker threw** on
+  every listing after somebody pressed "Look anyway".
+
 ### Site sharing status was read but never shown
 
 - `siteSettings` came back with **PascalCase** keys while the portal read
@@ -14,18 +31,6 @@ setting, and the portal footer at deploy time).
 - A site's settings arriving **after** it was opened now redraw the screen the
   user is on, so clicking faster than the lookup no longer loses the warning.
 
-### Every question is asked before the work starts
-
-- The deploy takes minutes, all typed input now happens in the first half minute
-
-### The portal upload was not a firewall problem
-
-- 
-  **shared-key access being switched off** (commonly by an Azure Policy)
-- The upload now runs **as the operator** (`--auth-mode login`) first, falling
-  back to the account key. The deploy grants itself Storage Blob Data Contributor
-  on that account.
-- When both fail it prints `allowSharedKeyAccess` and `publicNetworkAccess`
 
 ### Re-running no longer warns about things that are fine
 
@@ -35,19 +40,7 @@ setting, and the portal footer at deploy time).
   and close it again.
 - A failed portal upload is now **fatal in the deploy** and a listed blocker in
   the update.
-- Site settings carry SharePoint's **raw answer** alongside the conclusion, so a
-  wrong verdict can be checked against the source.
 
-### A delegated scope on a second resource could be reconciled and still missing
-
-- `requiredResourceAccess` was patched **once per resource**, reading the
-  application back between writes. Graph does not promise that read sees the
-  write, so the second resource could patch a list that no longer contained the
-  first, and which one survived depended on hashtable ordering. Built once and
-  patched once now.
-- `Update-Collaborate.ps1` **skipped delegated reconciliation silently** when it
-  could not read the app registration. It now says so and reports it as a
-  failure.
 
 ### Deploy: help choosing the address to allow
 
@@ -56,7 +49,7 @@ setting, and the portal footer at deploy time).
   recognised. Ported from M365AutoRevocate's
   `Show-ARSignInIpHint`, over `az rest` rather than the Az PowerShell module,
   which the deploy already requires.
-- It now also asks **outside** Cloud Shell, not only inside it.
+- It now also asks **outside** Cloud Shell.
 
 ## 0.6.0
 ### Two people can share with the same guest

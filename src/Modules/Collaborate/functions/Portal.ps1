@@ -57,6 +57,74 @@ function Get-CBPortalBanner {
     return @($banners)
 }
 
+function Get-CBUserLanguage {
+    <#
+    .SYNOPSIS
+        The language this person has chosen, or '' if they never chose one.
+    .DESCRIPTION
+        Never throws. A preference is a nicety; failing to read one must not stop
+        the portal loading.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$Oid)
+    try {
+        $row = Get-CBTableEntity -Table (Get-CBTableNames).Prefs -PartitionKey $Oid -RowKey 'portal'
+        if (-not $row) { return '' }
+        return (ConvertTo-CBLanguage -Value $row.language)
+    }
+    catch {
+        Write-Warning "Could not read the language preference for $Oid : $($_.Exception.Message)"
+        return ''
+    }
+}
+
+function Set-CBUserLanguage {
+    <#
+    .SYNOPSIS
+        Stores this person's language. An unsupported code clears the preference,
+        putting them back on the tenant default.
+    .OUTPUTS
+        The language that now applies to them.
+    #>
+    [CmdletBinding()] param(
+        [Parameter(Mandatory)][string]$Oid,
+        [AllowNull()]$Language,
+        $Settings
+    )
+    $code = ConvertTo-CBLanguage -Value $Language
+    $table = (Get-CBTableNames).Prefs
+    if ($code) {
+        Merge-CBTableEntity -Table $table -PartitionKey $Oid -RowKey 'portal' -Properties @{
+            language   = $code
+            updatedUtc = (Get-Date).ToUniversalTime().ToString('o')
+        }
+    }
+    else {
+        try { Remove-CBTableEntity -Table $table -PartitionKey $Oid -RowKey 'portal' } catch { }
+    }
+    return (Resolve-CBLanguage -Oid $Oid -Settings $Settings -Preference $code)
+}
+
+function Resolve-CBLanguage {
+    <#
+    .SYNOPSIS
+        The language to render for one person: their own choice, else the default
+        the administrator set.
+    .PARAMETER Preference
+        Their stored choice, when the caller already has it. Omit to look it up.
+    #>
+    [CmdletBinding()] param(
+        [Parameter(Mandatory)][string]$Oid,
+        $Settings,
+        [AllowNull()]$Preference
+    )
+    if (-not $Settings) { $Settings = Get-CBSettings }
+    $code = ConvertTo-CBLanguage -Value $Preference
+    if (-not $code) { $code = Get-CBUserLanguage -Oid $Oid }
+    if (-not $code) { $code = ConvertTo-CBLanguage -Value $Settings.portal.defaultLanguage }
+    if (-not $code) { $code = 'en' }
+    return $code
+}
+
 function Get-CBMePayload {
     <#
     .SYNOPSIS
@@ -108,6 +176,10 @@ function Get-CBMePayload {
         # to be refused at the end. Per-site blocks are not readable through
         # Graph and still only surface when a share is attempted.
         sharingPolicy = (Get-CBSharingPolicyPayload -Settings $Settings)
+        # Which language to render in, and what is on offer. Resolved server side
+        # so the answer is the same on any machine this person signs in from.
+        language      = (Resolve-CBLanguage -Oid $Caller.Oid -Settings $Settings)
+        languages     = @(Get-CBLanguages)
         setupComplete = [bool]$Settings.setupComplete
         simulation    = [bool]$Settings.dryRun
         banners       = @(Get-CBPortalBanner -Settings $Settings -Caller $Caller)

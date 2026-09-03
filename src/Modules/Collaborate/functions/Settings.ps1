@@ -8,6 +8,29 @@
 # The sanitiser is pure (no Graph, no storage), which is what makes the whole
 # validation surface unit testable.
 
+# The languages the portal ships translations for. Kept here rather than only in
+# web/i18n.js so the API can refuse a code the portal could not render; a test
+# asserts the two lists agree.
+$script:CBLanguages = @('en', 'nl')
+
+function Get-CBLanguages { return @($script:CBLanguages) }
+
+function ConvertTo-CBLanguage {
+    <#
+    .SYNOPSIS
+        A supported language code, or '' when the value is not one we ship.
+    .DESCRIPTION
+        Accepts a full tag ('nl-NL') and keeps the primary subtag, which is what
+        a browser's Accept-Language and navigator.language both hand over.
+    #>
+    [CmdletBinding()] param([AllowNull()]$Value)
+    $code = "$Value".Trim().ToLowerInvariant()
+    if (-not $code) { return '' }
+    $code = ($code -split '[-_]')[0]
+    if ($code -in $script:CBLanguages) { return $code }
+    return ''
+}
+
 function Get-CBDefaultSettings {
     <#
     .SYNOPSIS
@@ -125,6 +148,11 @@ function Get-CBDefaultSettings {
             notifyOwnerOnRedeem = $true
             orphanDigest       = $true
             versionCheckNotify = $true
+        }
+
+        # The language anybody sees before they have chosen one for themselves.
+        portal            = [ordered]@{
+            defaultLanguage = 'en'
         }
 
         logRetentionDays  = 365
@@ -327,6 +355,11 @@ function ConvertTo-CBSanitisedSettings {
         versionCheckNotify  = ConvertTo-CBBool -Value $notif.versionCheckNotify -Default $true
     }
 
+    # --- Portal --------------------------------------------------------------
+    $lang = ConvertTo-CBLanguage -Value $Raw.portal.defaultLanguage
+    if (-not $lang) { $lang = $def.portal.defaultLanguage }
+    $portal = [ordered]@{ defaultLanguage = $lang }
+
     return [ordered]@{
         setupComplete     = ConvertTo-CBBool -Value $Raw.setupComplete -Default $false
         setupCompletedUtc = ConvertTo-CBBoundedString -Value $Raw.setupCompletedUtc -MaxLength 40 -Default ''
@@ -341,6 +374,7 @@ function ConvertTo-CBSanitisedSettings {
         welcome           = $welcome
         safety            = (ConvertTo-CBSanitisedSafetySettings -Raw $Raw.safety)
         notifications     = $notifications
+        portal            = $portal
         logRetentionDays  = ConvertTo-CBInt -Value $Raw.logRetentionDays -Default 365 -Min 7 -Max 3650
         emails            = (ConvertTo-CBSanitisedEmails -Raw $Raw.emails)
     }

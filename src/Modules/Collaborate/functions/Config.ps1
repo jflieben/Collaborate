@@ -94,6 +94,7 @@ $script:CBTables = [pscustomobject]@{
     Activity   = 'ActivityLog'         # chronological audit feed shown in the portal
     Heartbeats = 'FunctionHeartbeats'  # last run/status/error per function, shown on Diagnostics
     Safety     = 'SafetyState'         # storm-guard counters + paused latch (circuit breaker)
+    Prefs      = 'UserPreferences'     # one row per internal user, partitioned by their object id
 }
 
 function Get-CBTableNames { return $script:CBTables }

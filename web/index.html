@@ -10,6 +10,9 @@
        there is no external CDN dependency and content filtering cannot break
        sign-in. -->
   <script src="msal-browser.min.js"></script>
+  <!-- Translations. Loaded before app.js so the static shell is swept once,
+       before anything wires an event handler. -->
+  <script src="i18n.js"></script>
   <!-- authConfig.js is written by the deploy script with your tenant's values -->
   <script src="authConfig.js"></script>
 </head>
@@ -37,6 +40,8 @@
       </div>
     </div>
     <div class="userbox">
+      <label class="sr-only" for="langPick">Language</label>
+      <select id="langPick" class="lang-pick" title="Language"></select>
       <span id="userName"></span>
       <button id="signOutBtn" class="btn ghost small">Sign out</button>
     </div>
@@ -370,6 +375,11 @@
           <label class="field"><span>Keep the activity log (days)</span>
             <input id="cfgLogRetention" type="number" min="7" max="3650" />
           </label>
+          <label class="field"><span>Default language</span>
+            <select id="cfgLanguage"></select>
+            <small>What everybody sees until they pick a language for themselves, top right. Their own choice
+              always wins and is remembered per person.</small>
+          </label>
         </div>
         <div class="checkline"><input id="cfgNotifyRedeem" type="checkbox" /><label for="cfgNotifyRedeem">Tell the owner when their guest accepts</label></div>
         <div class="checkline"><input id="cfgOrphanDigest" type="checkbox" /><label for="cfgOrphanDigest">Email the service desk about guests nobody owns</label></div>
@@ -549,7 +559,7 @@
 
   <!-- Colophon. Deliberately quiet: this tool wears the tenant's branding
        everywhere else, and one line of attribution is not a badge. -->
-  <footer class="colophon">
+  <footer class="colophon" data-i18n-skip>
     <span id="footVersion"></span><a href="https://jsolve.nl" target="_blank" rel="noopener noreferrer">Collaborate by JSolve B.V.</a>
   </footer>
 

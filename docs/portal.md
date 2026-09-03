@@ -199,6 +199,20 @@ the company is called. It reads a small public `assets/branding.json` that the
 app republishes alongside the welcome page. After
 sign-in the portal re-applies the authoritative values from `/api/me`.
 
+## Language
+
+The portal ships in **English and Dutch**.
+
+Which language somebody gets, in order:
+
+1. their own choice
+2. `portal.defaultLanguage` on the Configuration tab, which an administrator
+   sets for everybody who has not chosen;
+3. the browser's language
+4. English.
+
+The choice is also cached in `localStorage`
+
 ## Gotchas
 
 - Easy Auth must use `unauthenticatedClientAction = AllowAnonymous`, **not**

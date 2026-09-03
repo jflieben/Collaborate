@@ -27,6 +27,73 @@
     wizard: null       // { settings, step }
   };
 
+  /* ---------------- language ----------------
+     Resolution order: what this person chose, then what the administrator set as
+     the default, then the browser, then English.
+
+     The chosen language is cached in localStorage so a returning visitor gets
+     the right language on the FIRST paint, before /api/me has answered. The
+     server's answer is authoritative: when it disagrees with the cache, the page
+     reloads once. That is also how switching works, because the DOM sweep edits
+     elements in place and cannot be undone. */
+
+  var LANG_KEY = "cb.language";
+
+  function cachedLanguage() {
+    try { return window.localStorage.getItem(LANG_KEY) || ""; } catch (e) { return ""; }
+  }
+  // Returns whether the choice actually stuck. It does not in private mode with
+  // storage blocked, and that answer decides whether reloading is safe.
+  function cacheLanguage(code) {
+    try {
+      window.localStorage.setItem(LANG_KEY, code);
+      return window.localStorage.getItem(LANG_KEY) === code;
+    }
+    catch (e) { return false; }
+  }
+
+  function applyLanguage() {
+    var wanted = CBI18N.supported(cachedLanguage()) ||
+      CBI18N.supported(navigator.language || (navigator.languages || [])[0]) || "en";
+    CBI18N.setLanguage(wanted);
+    document.documentElement.setAttribute("lang", wanted);
+    // Patches the DOM writes first, so everything rendered from here on is
+    // translated as it is written, then sweeps the shell that is already there.
+    CBI18N.install();
+    CBI18N.translateDom(document.body);
+  }
+
+  // t() is used everywhere below, so it gets a short name.
+  function t(text, vars) { return CBI18N.t(text, vars); }
+
+  // Called once /api/me has said what this person should be seeing.
+  function reconcileLanguage(me) {
+    var wanted = CBI18N.supported(me && me.language) || "en";
+    if (wanted === CBI18N.getLanguage()) { renderLanguagePicker(wanted); return; }
+    // Only reload if the choice was actually remembered. If it was not, the
+    // reloaded page would resolve the same language again and reload again.
+    if (!cacheLanguage(wanted)) { renderLanguagePicker(CBI18N.getLanguage()); return; }
+    window.location.reload();
+  }
+
+  function renderLanguagePicker(active) {
+    var pick = el("langPick");
+    if (!pick) { return; }
+    pick.innerHTML = CBI18N.languages.map(function (l) {
+      return '<option value="' + esc(l.code) + '"' + (l.code === active ? " selected" : "") + ">" + esc(l.label) + "</option>";
+    }).join("");
+    pick.onchange = function () {
+      var chosen = pick.value;
+      cacheLanguage(chosen);   // best effort; the server copy is what persists
+      // Saved against the account so it follows them to another machine. The
+      // reload happens either way: a failed save still changes what they see
+      // here, it just will not be remembered elsewhere.
+      api("/me", "POST", { language: chosen })
+        .catch(function () { })
+        .then(function () { window.location.reload(); });
+    };
+  }
+
   /* ---------------- small helpers ---------------- */
 
   function esc(s) {
@@ -526,6 +593,7 @@
   function loadMe() {
     return api("/me").then(function (data) {
       state.me = data;
+      reconcileLanguage(data);
       renderShell();
       if (!data.setupComplete && data.user.isAdmin) { startWizard(); }
       return data;
@@ -775,7 +843,9 @@
     var seenNote = signInData();
     el("guestsSignInNote").hidden = false;
     el("guestsSignInNote").textContent = seenNote.available
-      ? "Last active is read from Entra sign-in data" + (seenNote.checkedAtLabel ? ", last checked " + seenNote.checkedAtLabel : "") + "."
+      ? (seenNote.checkedAtLabel
+        ? t("Last active is read from Entra sign-in data, last checked {when}.", { when: t(seenNote.checkedAtLabel) })
+        : t("Last active is read from Entra sign-in data."))
       : seenNote.note;
 
     // Only the states that need somebody to do something are called out. A row
@@ -1581,7 +1651,7 @@
     var labels = s.lockedRecipient ? ["What", "Confirm"] : SHARE_STEPS;
     var shown = s.lockedRecipient ? (s.step === 0 ? 0 : 1) : s.step;
     el("shSteps").innerHTML = labels.map(function (label, i) {
-      return '<span class="step' + (i === shown ? " active" : "") + '">' + (i + 1) + ". " + esc(label) + "</span>";
+      return '<span class="step' + (i === shown ? " active" : "") + '">' + (i + 1) + ". " + esc(t(label)) + "</span>";
     }).join(" ");
     el("shPick").hidden = s.step !== 0;
     el("shWho").hidden = s.step !== 1;
@@ -1680,18 +1750,27 @@
       blockedSites()[s.siteId] = known.reason || "SharePoint does not allow external sharing here.";
     }
     var blocked = s.siteId && blockedSites()[s.siteId];
-    if (blocked) {
+    if (blocked && !blockedAck()[s.siteId]) {
       host.innerHTML = '<div class="banner error"><div><div class="title">This site does not allow external sharing</div>' +
-        '<div class="small">' + esc(blocked) + " Nothing here can be shared outside the company. " +
-        "The person who owns the site can change that in SharePoint.</div>" +
+        '<div class="small">' + esc(blocked) + " " + esc(t("Nothing here can be shared outside the company. The person who owns the site can change that in SharePoint.")) + "</div>" +
         '<div class="row" style="margin-top:10px"><button type="button" class="btn small" id="shPickLeaveSite">Choose somewhere else</button>' +
         '<button type="button" class="btn small ghost" id="shPickAnyway">Look anyway</button></div></div></div>';
       el("shPickLeaveSite").onclick = function () {
         s.crumb = []; s.siteId = ""; renderPanes(); loadPane("sites");
       };
-      el("shPickAnyway").onclick = function () { delete blockedSites()[s.siteId]; renderPickItems(items, emptyReason); };
+      // Looking is allowed; sharing is not. The block is acknowledged rather
+      // than dropped, so the list below stays honest about what it can do.
+      el("shPickAnyway").onclick = function () { blockedAck()[s.siteId] = true; renderPickItems(items, emptyReason); };
       return;
     }
+    // The same block, once the user has said they want to see the contents
+    // anyway, or when SharePoint answered only after they had already opened
+    // the site. Every share control below is disabled while this is showing.
+    var blockedBanner = blocked
+      ? '<div class="banner warn"><div><div class="title">Sharing is blocked on this site</div>' +
+      '<div class="small">' + esc(blocked) + " " + esc(t("You can look around, but nothing here can be shared outside the company.")) + "</div>" +
+      '<div class="row" style="margin-top:10px"><button type="button" class="btn small" id="shPickLeaveSite">Choose somewhere else</button></div></div></div>'
+      : "";
     if (!items.length) {
       host.innerHTML = blockedBanner + '<p class="muted small">' + esc(emptyReason || "Nothing here.") + "</p>";
       wireLeaveSite();
@@ -1706,6 +1785,7 @@
     // keyboard navigation works.
     host.innerHTML = blockedBanner + note + items.map(function (it, i) {
       var openable = it.kind === "folder" || it.kind === "site" || it.kind === "drive";
+      if (blocked) { it = Object.assign({}, it, { canShare: false, shareBlockedReason: t("sharing is blocked on this site") }); }
       // What it is, where it lives, and when it was last touched. A column of
       // twenty file names is not enough to pick from: half of them are called
       // "Proposal" and the icon is eight pixels of guesswork.
@@ -1866,6 +1946,13 @@
   function blockedSites() {
     if (!state.blockedSites) { state.blockedSites = {}; }
     return state.blockedSites;
+  }
+
+  // Sites whose block the user has chosen to look past. Kept separate from the
+  // block itself so the warning survives, and the share controls stay disabled.
+  function blockedAck() {
+    if (!state.blockedAck) { state.blockedAck = {}; }
+    return state.blockedAck;
   }
 
   function openContainer(entry, isCrumb) {
@@ -2174,6 +2261,14 @@
 
     renderAdminAccess();
     el("cfgLogRetention").value = s.logRetentionDays;
+
+    var lang = el("cfgLanguage");
+    if (!lang.options.length) {
+      lang.innerHTML = CBI18N.languages.map(function (l) {
+        return '<option value="' + esc(l.code) + '">' + esc(l.label) + "</option>";
+      }).join("");
+    }
+    lang.value = (s.portal && s.portal.defaultLanguage) || "en";
     el("cfgNotifyRedeem").checked = truthy(s.notifications.notifyOwnerOnRedeem);
     el("cfgOrphanDigest").checked = truthy(s.notifications.orphanDigest);
 
@@ -2238,6 +2333,8 @@
     s.dryRun = el("cfgDryRun").value === "true";
     s.notifications.servicedeskEmail = el("cfgServicedesk").value.trim();
     s.logRetentionDays = Number(el("cfgLogRetention").value);
+    if (!s.portal) { s.portal = {}; }
+    s.portal.defaultLanguage = el("cfgLanguage").value;
     s.notifications.notifyOwnerOnRedeem = el("cfgNotifyRedeem").checked;
     s.notifications.orphanDigest = el("cfgOrphanDigest").checked;
 
@@ -2348,8 +2445,8 @@
       linked(app.displayName || "(unknown)", app.portalUrl) + "</div></div>" +
       '<div class="fact"><div class="k">Application (client) id</div><div class="v small">' + esc(app.appId || "") + "</div></div>" +
       "</div>" +
-      "<h3 style=\"font-size:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em\">Holds " +
-      esc(a.role || "the admin role") + "</h3>" +
+      "<h3 style=\"font-size:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em\">" +
+      esc(t("Holds {role}", { role: a.role || "the admin role" })) + "</h3>" +
       (who ? '<div class="access-list">' + who + "</div>" : "") +
       (a.error ? '<p class="status bad small">' + esc(a.error) + "</p>" : "");
   }
@@ -2682,21 +2779,29 @@
         '<p class="small muted">' + esc(d.welcomePage.detail || d.welcomePage.url) + "</p></div>" +
         '<div class="card"><h3>Safety</h3>' +
         (d.safety && d.safety.paused ? '<span class="pill bad">paused</span>' : '<span class="pill ok">running</span>') +
-        '<p class="small muted">Today: ' + esc((d.safety && d.safety.counts ? d.safety.counts.invite : 0)) + " invited, " +
-        esc((d.safety && d.safety.counts ? d.safety.counts.block : 0)) + " blocked, " +
-        esc((d.safety && d.safety.counts ? d.safety.counts.delete : 0)) + " deleted.</p></div>" +
+        '<p class="small muted">' + esc(t("Today: {invited} invited, {blocked} blocked, {deleted} deleted.", {
+          invited: (d.safety && d.safety.counts ? d.safety.counts.invite : 0),
+          blocked: (d.safety && d.safety.counts ? d.safety.counts.block : 0),
+          deleted: (d.safety && d.safety.counts ? d.safety.counts.delete : 0)
+        })) + "</p></div>" +
         // -1 means the queue does not exist yet, which is not the same as a
         // count and must never be shown as one.
-        '<div class="card"><h3>Queue</h3><p class="small muted">' + esc(queueCount(d.queues.work)) + " waiting, " +
-        esc(queueCount(d.queues.poison)) + " failed.</p></div>" +
-        '<div class="card"><h3>External accounts</h3>' +
-        ((d.guests && d.guests.unowned) ? '<span class="pill warn">' + esc(d.guests.unowned) + " with no owner</span>"
-          : '<span class="pill ok">all accounted for</span>') +
-        '<p class="small muted">' + esc((d.guests ? d.guests.population : 0)) + " guest(s) in the tenant.</p></div>" +
-        '<div class="card"><h3>Version</h3>' +
-        ((d.update && d.update.available) ? '<span class="pill warn">' + esc(d.update.latest) + " is available</span>"
-          : '<span class="pill ok">up to date</span>') +
-        '<p class="small muted">Running ' + esc(d.version) + (d.simulation ? " (simulation mode)" : "") +
+        '<div class="card"><h3>' + esc(t("Queue")) + '</h3><p class="small muted">' +
+        esc(t("{waiting} waiting, {failed} failed.", { waiting: queueCount(d.queues.work), failed: queueCount(d.queues.poison) })) +
+        "</p></div>" +
+        '<div class="card"><h3>' + esc(t("External accounts")) + "</h3>" +
+        ((d.guests && d.guests.unowned)
+          ? '<span class="pill warn">' + esc(t("{n} with no owner", { n: d.guests.unowned })) + "</span>"
+          : '<span class="pill ok">' + esc(t("all accounted for")) + "</span>") +
+        '<p class="small muted">' + esc(t("{n} external account(s) in the tenant.", { n: (d.guests ? d.guests.population : 0) })) +
+        "</p></div>" +
+        '<div class="card"><h3>' + esc(t("Version")) + "</h3>" +
+        ((d.update && d.update.available)
+          ? '<span class="pill warn">' + esc(t("{version} is available", { version: d.update.latest })) + "</span>"
+          : '<span class="pill ok">' + esc(t("up to date")) + "</span>") +
+        '<p class="small muted">' +
+        esc(d.simulation ? t("Running {version} (simulation mode)", { version: d.version })
+          : t("Running {version}", { version: d.version })) +
         (d.update && d.update.detail ? "<br>" + esc(d.update.detail) : "") + "</p></div>";
 
       var rows = el("diagRows");
@@ -2705,7 +2810,7 @@
         var tr = document.createElement("tr");
         tr.innerHTML = "<td>" + esc(h.name) + "</td><td>" + esc(fmtDate(h.lastRunUtc)) + "</td>" +
           "<td>" + (h.lastStatus === "ok" ? '<span class="pill ok">ok</span>' : '<span class="pill bad">failed</span>') + "</td>" +
-          "<td>" + esc(h.lastDurationMs) + " ms</td>" +
+          "<td>" + esc(t("{ms} ms", { ms: h.lastDurationMs })) + "</td>" +
           '<td class="small">' + esc(h.lastError || "") + "</td>";
         rows.appendChild(tr);
       });
@@ -2731,7 +2836,7 @@
     var s = w.settings;
 
     el("wizSteps").innerHTML = WIZARD_STEPS.map(function (label, i) {
-      return '<span class="step' + (i === w.step ? " active" : "") + '">' + (i + 1) + ". " + esc(label) + "</span>";
+      return '<span class="step' + (i === w.step ? " active" : "") + '">' + (i + 1) + ". " + esc(t(label)) + "</span>";
     }).join(" ");
 
     var body = el("wizBody");
@@ -2919,6 +3024,7 @@
     el("signInBtn").onclick = function () { msalInstance.loginRedirect(loginRequest); };
   }
 
+  applyLanguage();
   loadPublicBranding();
   wire();
 

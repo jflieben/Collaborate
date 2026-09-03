@@ -1950,3 +1950,43 @@ Describe 'Get-CBGuestSortKey' {
         $soon | Should -BeLessThan $later
     }
 }
+
+Describe 'ConvertTo-CBLanguage' {
+    It 'accepts a shipped language' { ConvertTo-CBLanguage -Value 'nl' | Should -Be 'nl' }
+    It 'keeps the primary subtag of a full tag' { ConvertTo-CBLanguage -Value 'nl-NL' | Should -Be 'nl' }
+    It 'is case insensitive' { ConvertTo-CBLanguage -Value 'EN' | Should -Be 'en' }
+    It 'returns empty for a language we do not ship' { ConvertTo-CBLanguage -Value 'de' | Should -Be '' }
+    It 'returns empty for nothing' { ConvertTo-CBLanguage -Value $null | Should -Be '' }
+}
+
+Describe 'Default language setting' {
+    It 'ships English' { (Get-CBDefaultSettings).portal.defaultLanguage | Should -Be 'en' }
+    It 'keeps a shipped language' {
+        $raw = [pscustomobject]@{ portal = @{ defaultLanguage = 'nl-BE' } }
+        (ConvertTo-CBSanitisedSettings -Raw $raw).portal.defaultLanguage | Should -Be 'nl'
+    }
+    It 'falls back when the language is not one we ship' {
+        $raw = [pscustomobject]@{ portal = @{ defaultLanguage = 'klingon' } }
+        (ConvertTo-CBSanitisedSettings -Raw $raw).portal.defaultLanguage | Should -Be 'en'
+    }
+    It 'survives a settings blob written before this setting existed' {
+        (ConvertTo-CBSanitisedSettings -Raw ([pscustomobject]@{})).portal.defaultLanguage | Should -Be 'en'
+    }
+}
+
+Describe 'The portal and the API agree on which languages exist' {
+    # web/i18n.js decides what can actually be rendered. If the API accepted a
+    # code the portal has no dictionary for, that person would get an English
+    # page and no way to see why.
+    It 'ships the same list on both sides' {
+        $js = Get-Content (Join-Path $PSScriptRoot '..\web\i18n.js') -Raw
+        $codes = [regex]::Matches($js, '\{\s*code:\s*"([a-z]{2})"') | ForEach-Object { $_.Groups[1].Value }
+        ($codes | Sort-Object) -join ',' | Should -Be ((Get-CBLanguages | Sort-Object) -join ',')
+    }
+    It 'has a dictionary for every non-English language' {
+        $js = Get-Content (Join-Path $PSScriptRoot '..\web\i18n.js') -Raw
+        foreach ($code in (Get-CBLanguages | Where-Object { $_ -ne 'en' })) {
+            $js | Should -Match ("DICTIONARIES\s*=\s*\{[^}]*\b$code\s*:")
+        }
+    }
+}

@@ -10,6 +10,7 @@
 #   ActivityLog        - chronological audit feed shown in the portal
 #   FunctionHeartbeats - per-function last run/status/error
 #   SafetyState        - storm-guard counters + paused latch
+#   UserPreferences    - per-user portal choices, PartitionKey = user object id
 
 function Get-CBStorageToken {
     [CmdletBinding()] param()
@@ -94,7 +95,7 @@ function Initialize-CBTables {
     [CmdletBinding()] param([switch]$Force)
     if ($script:CBTablesReady -and -not $Force) { return }
     $tables = Get-CBTableNames
-    foreach ($name in @($tables.Guests, $tables.Activity, $tables.Heartbeats, $tables.Safety)) {
+    foreach ($name in @($tables.Guests, $tables.Activity, $tables.Heartbeats, $tables.Safety, $tables.Prefs)) {
         $result = Invoke-CBTable -Method Post -Path 'Tables' -Body @{ TableName = $name } -Raw
         if ($result.StatusCode -eq 409) { continue }         # already exists
         if ($result.StatusCode -ge 400) {

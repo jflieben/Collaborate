@@ -72,6 +72,15 @@ p { margin: 0 0 12px; }
 .brand .title { font-weight: 600; font-size: 17px; }
 .brand .subtitle { font-size: 13px; opacity: .85; }
 .userbox { display: flex; align-items: center; gap: 12px; font-size: 14px; white-space: nowrap; }
+.lang-pick {
+  padding: 4px 8px; font-size: 13px; min-width: auto; width: auto;
+  background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+}
+/* Visible to a screen reader, not on screen. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
 
 /* ---------- layout ---------- */
 .container { max-width: 1080px; margin: 0 auto; padding: 24px; }

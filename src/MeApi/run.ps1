@@ -22,6 +22,15 @@ try {
     if (-not $caller.Ok) { Send-Json -Status $caller.Status -Object @{ error = $caller.Error }; return }
 
     Initialize-CBTables
+
+    # POST carries this person's own portal preferences and nothing else. It sets
+    # no policy, so it needs no role beyond being signed in.
+    if ("$($Request.Method)".ToUpperInvariant() -eq 'POST') {
+        $body = $Request.Body
+        if ($body -is [string]) { $body = $body | ConvertFrom-Json }
+        $null = Set-CBUserLanguage -Oid $caller.Oid -Language $body.language
+    }
+
     Send-Json -Status 200 -Object (Get-CBMePayload -Caller $caller)
 }
 catch {
