@@ -40,7 +40,9 @@ function Write-CBActivity {
         $Detail
     )
     $tables = Get-CBTableNames
-    $rowKey = ('{0:D19}' -f ([DateTime]::MaxValue.Ticks - [DateTime]::UtcNow.Ticks))
+    # Newest first by key; the random tail keeps two entries in the same tick
+    # from overwriting each other.
+    $rowKey = ('{0:D19}_{1}' -f ([DateTime]::MaxValue.Ticks - [DateTime]::UtcNow.Ticks), [Guid]::NewGuid().ToString('N').Substring(0, 6))
     $summary = if ($null -ne $Detail) {
         if ($Detail -is [string]) { @{ detail = $Detail } | ConvertTo-Json -Compress }
         else { $Detail | ConvertTo-Json -Depth 10 -Compress }

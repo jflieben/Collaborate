@@ -23,6 +23,8 @@
 #      rejected even if it carries our app roles.
 
 $script:CBJwksCache = $null
+$script:CBJwksFetchedUtc = [DateTime]::MinValue
+$script:CBMemberCache = @{}
 
 function ConvertFrom-CBBase64Url {
     param([Parameter(Mandatory)][string]$Value)
@@ -33,11 +35,18 @@ function ConvertFrom-CBBase64Url {
 
 function Get-CBJwks {
     [CmdletBinding()] param([switch]$Refresh)
-    if ($script:CBJwksCache -and -not $Refresh) { return $script:CBJwksCache }
+    if ($script:CBJwksCache) {
+        # A forced refresh is honoured at most once per five minutes, so an
+        # anonymous caller sending made-up key ids cannot make every request
+        # fetch the key set again.
+        $recent = ([DateTime]::UtcNow - $script:CBJwksFetchedUtc).TotalMinutes -lt 5
+        if (-not $Refresh -or $recent) { return $script:CBJwksCache }
+    }
     $cfg = Get-CBConfig
     $uri = '{0}/{1}/discovery/v2.0/keys' -f $cfg.LoginResource.TrimEnd('/'), $cfg.TenantId
     $resp = Invoke-RestMethod -Method Get -Uri $uri -ErrorAction Stop
     $script:CBJwksCache = $resp.keys
+    $script:CBJwksFetchedUtc = [DateTime]::UtcNow
     return $script:CBJwksCache
 }
 
@@ -69,13 +78,20 @@ function Test-CBJwt {
     # Issuer and tenant must both be ours. Checking 'tid' as well as the issuer
     # string closes the multi-tenant impersonation gap if the app registration is
     # ever switched to a multi-tenant audience.
+    # Exact issuer: v1 (sts.windows.net) or v2 (login authority) for this tenant.
     $iss = "$($payload.iss)"
-    if ($iss -notmatch [regex]::Escape($cfg.TenantId)) { return @{ Valid = $false; Error = "wrong issuer '$iss'" } }
-    if ($payload.tid -and "$($payload.tid)" -ne $cfg.TenantId) { return @{ Valid = $false; Error = "token is from tenant '$($payload.tid)'" } }
+    $issuers = @(
+        "https://sts.windows.net/$($cfg.TenantId)/"
+        '{0}/{1}/v2.0' -f $cfg.LoginResource.TrimEnd('/'), $cfg.TenantId
+    )
+    if ($issuers -notcontains $iss) { return @{ Valid = $false; Error = "wrong issuer '$iss'" } }
+    if ("$($payload.tid)" -ne $cfg.TenantId) { return @{ Valid = $false; Error = "token is from tenant '$($payload.tid)'" } }
 
-    # Expiry / not-before (allow 5 min clock skew).
+    # Expiry / not-before (allow 5 min clock skew). A token without exp is refused.
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-    if ($payload.exp -and [long]$payload.exp -lt ($now - 300)) { return @{ Valid = $false; Error = 'token expired' } }
+    $exp = 0L
+    if (-not [long]::TryParse("$($payload.exp)", [ref]$exp)) { return @{ Valid = $false; Error = 'token has no expiry' } }
+    if ($exp -lt ($now - 300)) { return @{ Valid = $false; Error = 'token expired' } }
     if ($payload.nbf -and [long]$payload.nbf -gt ($now + 300)) { return @{ Valid = $false; Error = 'token not yet valid' } }
 
     # Signature: find the signing key by kid, verify over header.payload.
@@ -95,8 +111,8 @@ function Test-CBJwt {
             $verified = $rsa.VerifyData($signed, $sig, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
         }
         catch { return @{ Valid = $false; Error = "signature check error: $($_.Exception.Message)" } }
-        if ($verified) { break }
-        if (-not $refresh) { continue }  # kid found but bad sig: no point retrying
+        # Known kid either way: a bad signature will not improve with fresh keys.
+        break
     }
     if (-not $verified) { return @{ Valid = $false; Error = 'signature not verified (unknown key or bad signature)' } }
 
@@ -258,6 +274,13 @@ function Resolve-CBCaller {
         return @{ Ok = $false; Status = 403; Error = 'The token does not identify a user.' }
     }
 
+    # A guest that signs in with credentials in this tenant carries neither idp
+    # nor (without the optional claim) acct, so the directory is asked. Cached
+    # per worker for an hour; a failed lookup refuses rather than guesses.
+    if (-not (Test-CBMemberAccount -Oid $oid)) {
+        return @{ Ok = $false; Status = 403; Error = 'Collaborate is only available to internal accounts.' }
+    }
+
     $upn = @($claims.preferred_username, $claims.upn, $claims.unique_name) | Where-Object { $_ } | Select-Object -First 1
     $name = @($claims.name, $upn, $principalName) | Where-Object { $_ } | Select-Object -First 1
     $roles = Get-CBCallerRole -Claims $claims
@@ -267,7 +290,11 @@ function Resolve-CBCaller {
     # deploy is an admin even though no app-role assignment has propagated yet.
     # This is ignored the moment setup completes.
     if (-not $isAdmin -and $cfg.BootstrapAdminOid -and $oid -eq $cfg.BootstrapAdminOid) {
-        if (-not (Test-CBSetupComplete)) {
+        # Settings that cannot be read count as "setup complete" here: a storage
+        # hiccup must not hand admin rights back.
+        $setupDone = $true
+        try { $setupDone = [bool](Get-CBSettings).setupComplete } catch { Write-Warning "Could not read settings for the bootstrap check: $($_.Exception.Message)" }
+        if (-not $setupDone) {
             Write-Warning "Granting bootstrap admin rights to the deploying operator ($oid) because setup is not complete."
             $isAdmin = $true
         }
@@ -283,6 +310,21 @@ function Resolve-CBCaller {
         IsAdmin     = $isAdmin
         Token       = $token
     }
+}
+
+function Test-CBMemberAccount {
+    <#
+    .SYNOPSIS
+        True when this object id is an internal Member account.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$Oid)
+    $hit = $script:CBMemberCache[$Oid]
+    if ($hit -and $hit -gt [DateTime]::UtcNow) { return $true }
+    $account = Get-CBUserProfile -Oid $Oid
+    if (-not $account -or "$($account.userType)" -ne 'Member') { return $false }
+    if ($script:CBMemberCache.Count -gt 5000) { $script:CBMemberCache.Clear() }
+    $script:CBMemberCache[$Oid] = [DateTime]::UtcNow.AddHours(1)
+    return $true
 }
 
 function Test-CBAdminRequest {

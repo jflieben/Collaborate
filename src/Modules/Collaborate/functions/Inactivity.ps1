@@ -53,7 +53,7 @@ function Get-CBUserSignInActivity {
                     "$($u.signInActivity.lastSuccessfulSignInDateTime)",
                     "$($u.signInActivity.lastSignInDateTime)",
                     "$($u.signInActivity.lastNonInteractiveSignInDateTime)"
-                ) | Where-Object { $_ -and $_ -ne '0001-01-01T00:00:00Z' } | Select-Object -First 1
+                ) | Where-Object { $d = ConvertTo-CBDateOnly -Value $_; $d -and $d.Year -gt 1900 } | Select-Object -First 1
             }
             $map["$($u.id)"] = @{ LastSignIn = "$last"; Created = "$($u.createdDateTime)" }
         }

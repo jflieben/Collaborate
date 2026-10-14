@@ -9,9 +9,8 @@
 # and az to be signed in. $PSScriptRoot always resolves to this file's folder, so
 # permissions.json is found regardless of who dot-sources it.
 #
-# The three network helpers at the top are the exception: install.ps1 dot-sources
-# this file just for those, before the deploy runs, so they call az directly and
-# depend on nothing else here.
+# The three network helpers at the top are the exception: they call az directly
+# and depend on nothing else here, so they stay usable on their own.
 
 function Get-MyPublicIp {
     foreach ($svc in @('https://api.ipify.org', 'https://ifconfig.me/ip', 'https://icanhazip.com')) {
@@ -57,8 +56,7 @@ function Show-CBSignInIpHint {
     [CmdletBinding()] param([int]$Sample = 25)
     Write-Host 'Looking up the addresses you have recently signed in from...'
     try {
-        # az directly rather than Invoke-Az: install.ps1 dot-sources this file to
-        # show the hint before the deploy runs, and does not define that helper.
+        # az directly rather than Invoke-Az, so the hint stays self-contained.
         $me = (& az rest --method GET --url 'https://graph.microsoft.com/v1.0/me' --only-show-errors 2>$null) | Out-String | ConvertFrom-Json
         $upn = "$($me.userPrincipalName)"
         if ($upn) {
@@ -115,6 +113,13 @@ function Invoke-CBPortalUpload {
 
         The account holds the portal's static files: no data, no tokens, no
         secrets. The window is the length of one upload and it is announced.
+
+        The operator's Storage Blob Data Contributor role is removed again
+        afterwards if this run created it. It is kept only when the upload
+        failed, so a re-run can use it once it has propagated.
+    .PARAMETER IndexDocument
+        When set, static website hosting is (re)configured inside the same
+        firewall window, before the upload.
     .OUTPUTS
         $true when the portal was uploaded.
     #>
@@ -124,7 +129,9 @@ function Invoke-CBPortalUpload {
         [Parameter(Mandatory)][string]$ResourceGroup,
         [Parameter(Mandatory)][string]$Source,
         [string]$AccountKey,
-        [string]$SubscriptionId
+        [string]$SubscriptionId,
+        [string]$IndexDocument,
+        [string]$NotFoundDocument
     )
     $settings = $null
     try {
@@ -136,13 +143,20 @@ function Invoke-CBPortalUpload {
     $wasDenying = $settings -and "$($settings.defaultAction)" -eq 'Deny'
 
     # The operator's own identity needs a data-plane role; being Owner does not
-    # grant one. Idempotent, and a failure here is not fatal because the key path
-    # may still work.
+    # grant one. A failure here is not fatal because the key path may still work.
+    $createdRoleId = $null
     if ($settings -and $settings.id) {
         $me = Get-AzScalar (Invoke-Az -AzArgs @('ad', 'signed-in-user', 'show', '--query', 'id', '-o', 'tsv') -AllowFail)
         if ($me) {
-            Invoke-Az -AzArgs @('role', 'assignment', 'create', '--assignee-object-id', $me, '--assignee-principal-type', 'User',
-                '--role', 'Storage Blob Data Contributor', '--scope', $settings.id) -AllowFail | Out-Null
+            $haveRole = Get-AzScalar (Invoke-Az -AzArgs @('role', 'assignment', 'list', '--assignee', $me,
+                    '--role', 'Storage Blob Data Contributor', '--scope', $settings.id, '--query', '[0].id', '-o', 'tsv') -AllowFail)
+            $listOk = ($LASTEXITCODE -eq 0)
+            if (-not $haveRole) {
+                $newRoleId = Get-AzScalar (Invoke-Az -AzArgs @('role', 'assignment', 'create', '--assignee-object-id', $me, '--assignee-principal-type', 'User',
+                        '--role', 'Storage Blob Data Contributor', '--scope', $settings.id, '--query', 'id', '-o', 'tsv') -AllowFail)
+                # Only track it for removal when the list proved it was not there before.
+                if ($listOk -and $newRoleId) { $createdRoleId = $newRoleId }
+            }
         }
     }
 
@@ -152,13 +166,21 @@ function Invoke-CBPortalUpload {
         Start-Sleep -Seconds 20
     }
 
+    $uploadOk = $false
     try {
+        if ($IndexDocument) {
+            $notFound = if ($NotFoundDocument) { $NotFoundDocument } else { $IndexDocument }
+            if (-not (Set-CBStaticWebsite -Account $Account -IndexDocument $IndexDocument -NotFoundDocument $notFound -AccountKey $AccountKey)) {
+                Write-Warning "Static website hosting could not be configured on $Account."
+            }
+        }
+
         $base = @('storage', 'blob', 'upload-batch', '--account-name', $Account, '--destination', '$web', '--source', $Source, '--overwrite')
         # The signed-in identity first: it keeps working when shared-key access is
         # switched off, which is the failure that looks like a firewall problem.
-        if ($null -ne (Invoke-Az -AzArgs ($base + @('--auth-mode', 'login')) -AllowFail)) { return $true }
+        if ($null -ne (Invoke-Az -AzArgs ($base + @('--auth-mode', 'login')) -AllowFail)) { $uploadOk = $true; return $true }
         Write-Host 'Uploading as you did not work; trying the account key...'
-        if ($AccountKey -and $null -ne (Invoke-Az -AzArgs ($base + @('--account-key', $AccountKey)) -AllowFail)) { return $true }
+        if ($AccountKey -and $null -ne (Invoke-Az -AzArgs ($base + @('--account-key', $AccountKey)) -AllowFail)) { $uploadOk = $true; return $true }
 
         Write-Warning "The portal could not be uploaded to $Account."
         if ($settings) {
@@ -180,7 +202,43 @@ function Invoke-CBPortalUpload {
                 Write-Warning "The $Account firewall is STILL OPEN. Close it now: az storage account update --name $Account --resource-group $ResourceGroup --default-action Deny --bypass AzureServices"
             }
         }
+        if ($createdRoleId) {
+            if ($uploadOk) {
+                & az role assignment delete --ids $createdRoleId --only-show-errors 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "Could not remove your temporary Storage Blob Data Contributor role on $Account. Remove it: az role assignment delete --ids $createdRoleId"
+                }
+            }
+            else {
+                Write-Warning "Your Storage Blob Data Contributor role on $Account was kept so a re-run can upload. Remove it once the portal is uploaded: az role assignment delete --ids $createdRoleId"
+            }
+        }
     }
+}
+
+function Set-CBStaticWebsite {
+    <#
+    .SYNOPSIS
+        Enables static website hosting on a storage account. Tries the account
+        key, then the signed-in identity.
+    .OUTPUTS
+        $true when it was configured.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Account,
+        [Parameter(Mandatory)][string]$IndexDocument,
+        [Parameter(Mandatory)][string]$NotFoundDocument,
+        [string]$AccountKey
+    )
+    $base = @('storage', 'blob', 'service-properties', 'update', '--account-name', $Account,
+        '--static-website', '--index-document', $IndexDocument, '--404-document', $NotFoundDocument)
+    if ($AccountKey) {
+        Invoke-Az -AzArgs ($base + @('--account-key', $AccountKey)) -AllowFail | Out-Null
+        if ($LASTEXITCODE -eq 0) { return $true }
+    }
+    Invoke-Az -AzArgs ($base + @('--auth-mode', 'login')) -AllowFail | Out-Null
+    return ($LASTEXITCODE -eq 0)
 }
 
 function Get-CBRequirement {
@@ -231,14 +289,19 @@ function Update-CBPermission {
         = fully reconciled). Granting requires Global Administrator or Privileged
         Role Administrator; failures are reported, not thrown, so an unattended
         update without those rights degrades gracefully.
+
+        App roles the identity holds that permissions.json no longer lists are
+        reported as warnings, and only removed with -PruneUnlisted.
     .PARAMETER PrincipalId
         Object id of the Function App's system-assigned managed identity.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$PrincipalId)
+    param([Parameter(Mandatory)][string]$PrincipalId, [switch]$PruneUnlisted)
 
     $req = Get-CBRequirement
     $failed = [System.Collections.Generic.List[string]]::new()
+    $wantedPairs = @{}
+    $resolveComplete = $true
 
     # One read of what the identity already holds, reused for every check.
     $existing = Invoke-CBGraphJson -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$PrincipalId/appRoleAssignments" -AllowFail
@@ -259,6 +322,7 @@ function Update-CBPermission {
         $sp = $spByKey[$resKey]
         if (-not $sp -or -not $sp.id) {
             Write-Warning "Could not resolve the '$resName' service principal; '$($role.value)' cannot be granted."
+            $resolveComplete = $false
             $failed.Add($label); continue
         }
         $appRole = $sp.appRoles | Where-Object { $_.value -eq $role.value -and $_.allowedMemberTypes -contains 'Application' } | Select-Object -First 1
@@ -266,6 +330,7 @@ function Update-CBPermission {
             Write-Warning "App role '$($role.value)' not found on '$resName'; skipping."
             $failed.Add($label); continue
         }
+        $wantedPairs["$($sp.id)|$($appRole.id)"] = $true
         if ($existingList | Where-Object { $_.appRoleId -eq $appRole.id -and $_.resourceId -eq $sp.id }) {
             Write-Host "Already granted: $label"
             continue
@@ -276,6 +341,27 @@ function Update-CBPermission {
         if (-not $grant) {
             Write-Warning "Could not grant '$label' (needs Global Administrator / Privileged Role Administrator)."
             $failed.Add($label)
+        }
+    }
+
+    # --- App roles no longer listed --------------------------------------------
+    # Skipped when the current grants or a resource could not be read: anything
+    # unresolved would otherwise look unlisted.
+    if ($existing -and $resolveComplete) {
+        $zeroRole = '00000000-0000-0000-0000-000000000000'
+        foreach ($extra in @($existingList | Where-Object { "$($_.appRoleId)" -ne $zeroRole -and -not $wantedPairs.ContainsKey("$($_.resourceId)|$($_.appRoleId)") })) {
+            $resSp = @($spByKey.Values | Where-Object { $_ -and "$($_.id)" -eq "$($extra.resourceId)" })[0]
+            $value = if ($resSp) { "$(@($resSp.appRoles | Where-Object { "$($_.id)" -eq "$($extra.appRoleId)" })[0].value)" } else { '' }
+            if (-not $value) { $value = "$($extra.appRoleId)" }
+            $label = "$value ($($extra.resourceDisplayName))"
+            if ($PruneUnlisted) {
+                Invoke-CBGraphJson -Method DELETE -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$PrincipalId/appRoleAssignments/$($extra.id)" -AllowFail | Out-Null
+                if ($LASTEXITCODE -eq 0) { Write-Host "Removed unlisted application permission: $label" }
+                else { Write-Warning "Could not remove unlisted application permission '$label'." }
+            }
+            else {
+                Write-Warning "The managed identity holds '$label', which permissions.json no longer lists. Remove it from the managed identity's API permissions, or re-run with -PruneUnlistedPermissions."
+            }
         }
     }
 
@@ -326,12 +412,15 @@ function Update-CBDelegatedPermission {
             interactive 'az ad app permission admin-consent' path has a habit of
             reporting success while granting nothing.
         Returns descriptions of anything it could not grant (empty = all good).
+        Consented scopes that permissions.json no longer lists are reported as
+        warnings, and only removed with -PruneUnlisted.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$AppId,
         [Parameter(Mandatory)][string]$AppObjectId,
-        [Parameter(Mandatory)][string]$ServicePrincipalId
+        [Parameter(Mandatory)][string]$ServicePrincipalId,
+        [switch]$PruneUnlisted
     )
     $req = Get-CBRequirement
     $failed = [System.Collections.Generic.List[string]]::new()
@@ -426,6 +515,38 @@ function Update-CBDelegatedPermission {
             if (-not $created) {
                 Write-Warning "Could not consent delegated permissions for $($entry.Name) (needs Global Administrator / Privileged Role Administrator). Sharing will not work until this is granted."
                 $wantedValues | ForEach-Object { $failed.Add("$_ (delegated)") }
+            }
+        }
+    }
+
+    # --- Consented scopes no longer listed -------------------------------------
+    # Skipped when a listed resource could not be resolved, since its grant would
+    # then look entirely unlisted. Sign-in scopes are never reported.
+    $unresolved = @($byResource.Values | Where-Object { -not $_.Sp -or -not $_.Sp.id })
+    if ($unresolved.Count -eq 0) {
+        $oidcScopes = @('openid', 'profile', 'email', 'offline_access')
+        $enc = [Uri]::EscapeDataString("clientId eq '$ServicePrincipalId'")
+        $allGrants = Invoke-CBGraphJson -Method GET -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=$enc" -AllowFail
+        foreach ($g in @($allGrants.value | Where-Object { $_ -and $_.consentType -eq 'AllPrincipals' })) {
+            $entry = @($byResource.Values | Where-Object { "$($_.Sp.id)" -eq "$($g.resourceId)" })[0]
+            $listed = if ($entry) { @($entry.Wanted | ForEach-Object { $_.Value }) } else { @() }
+            $resName = if ($entry) { $entry.Name } else { "resource $($g.resourceId)" }
+            $have = @("$($g.scope)" -split '\s+' | Where-Object { $_ })
+            $extra = @($have | Where-Object { $listed -notcontains $_ -and $oidcScopes -notcontains $_ })
+            if ($extra.Count -eq 0) { continue }
+            if ($PruneUnlisted) {
+                $keep = @($have | Where-Object { $extra -notcontains $_ })
+                if ($keep.Count -gt 0) {
+                    Invoke-CBGraphJson -Method PATCH -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/$($g.id)" -Body @{ scope = ($keep -join ' ') } -AllowFail | Out-Null
+                }
+                else {
+                    Invoke-CBGraphJson -Method DELETE -Uri "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/$($g.id)" -AllowFail | Out-Null
+                }
+                if ($LASTEXITCODE -eq 0) { Write-Host "Removed unlisted delegated permission(s) for ${resName}: $($extra -join ', ')" }
+                else { Write-Warning "Could not remove unlisted delegated permission(s) for ${resName}: $($extra -join ', ')." }
+            }
+            else {
+                Write-Warning "Delegated permission(s) consented for $resName that permissions.json no longer lists: $($extra -join ', '). Revoke them on the '$AppId' enterprise application, or re-run with -PruneUnlistedPermissions."
             }
         }
     }
@@ -536,6 +657,47 @@ function Get-CBFunctionAppHost {
 
     Write-Warning "Azure could not report the host name for '$AppName'; assuming the public cloud default."
     return "$AppName.azurewebsites.net"
+}
+
+function Set-CBPackageVersion {
+    <#
+    .SYNOPSIS
+        Writes the release version into the STAGED module manifest, so the code
+        that ships reports the version it actually is.
+    .DESCRIPTION
+        VERSION is the single source, and it reached the CB_VERSION app setting
+        but never the manifest, so the running module reported whatever
+        ModuleVersion happened to be committed. StatusApi compares the two to
+        catch a zip that did not land, and with nothing keeping them in step that
+        check cried wolf on every install instead of catching a real one.
+
+        Stamped in the staging copy, never in the working tree, so building a
+        package leaves the repo clean.
+    .PARAMETER StagePath
+        The staged copy of src, not the repo.
+    .OUTPUTS
+        The version written.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$StagePath,
+        [Parameter(Mandatory)][string]$Version
+    )
+    # A module manifest takes 2 to 4 numeric parts and nothing else. Failing here
+    # is better than shipping a manifest the Functions host refuses to import.
+    if ($Version -notmatch '^\d+(\.\d+){1,3}$') {
+        throw "VERSION is '$Version', which a module manifest cannot hold. Use two to four numbers, for example 0.7.0."
+    }
+    $manifest = Join-Path $StagePath 'Modules/Collaborate/Collaborate.psd1'
+    if (-not (Test-Path $manifest)) { throw "The staged package has no module manifest at $manifest." }
+
+    $text = Get-Content $manifest -Raw
+    $stamped = [regex]::Replace($text, "(?m)^(\s*ModuleVersion\s*=\s*')[^']*(')", "`${1}$Version`${2}")
+    if ($stamped -eq $text -and $text -notmatch "ModuleVersion\s*=\s*'$([regex]::Escape($Version))'") {
+        throw "Could not find ModuleVersion to stamp in $manifest."
+    }
+    Set-Content -Path $manifest -Value $stamped -NoNewline -Encoding utf8
+    return $Version
 }
 
 function Publish-CBFunctionCode {

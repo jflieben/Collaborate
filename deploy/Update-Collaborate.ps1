@@ -21,25 +21,42 @@
 
 .PARAMETER SenderUpn
     Used only to resolve the tenant, so an update cannot be aimed at the wrong one.
+
+.PARAMETER PruneUnlistedPermissions
+    Remove application and delegated permissions that are granted but no longer
+    listed in deploy/permissions.json. Without it they are only reported.
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
     [Parameter(Mandatory)][string]$SubscriptionId,
     [Parameter(Mandatory)][string]$SenderUpn,
     [string]$ResourceGroup = 'rg-collaborate',
-    [string]$AppName
+    [string]$AppName,
+    [switch]$PruneUnlistedPermissions
 )
 
 $ErrorActionPreference = 'Stop'
 
 function Write-Step { param([string]$Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 
+function Format-AzArgsRedacted {
+    # Az arguments as text for an error message, with keys, SAS tokens and
+    # connection strings masked.
+    param([string[]]$AzArgs)
+    $secretFlags = @('--account-key', '--sas-token', '--connection-string')
+    $shown = for ($i = 0; $i -lt $AzArgs.Count; $i++) {
+        if ($i -gt 0 -and $secretFlags -contains $AzArgs[$i - 1]) { '***' }
+        else { $AzArgs[$i] -replace '(?i)(AccountKey=|SharedAccessSignature=|sig=)[^;&\s"]+', '${1}***' }
+    }
+    return ($shown -join ' ')
+}
+
 function Invoke-Az {
     param([Parameter(Mandatory)][string[]]$AzArgs, [switch]$AllowFail)
     if ($AzArgs -notcontains '--only-show-errors') { $AzArgs += '--only-show-errors' }
     $out = & az @AzArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
-        if (-not $AllowFail) { throw "az $($AzArgs -join ' ') failed:`n$out" }
+        if (-not $AllowFail) { throw "az $(Format-AzArgsRedacted -AzArgs $AzArgs) failed:`n$(Format-AzArgsRedacted -AzArgs @("$out"))" }
         return $null
     }
     return $out
@@ -84,6 +101,21 @@ Invoke-Az -AzArgs @('account', 'set', '--subscription', $SubscriptionId) | Out-N
 $account = az account show | ConvertFrom-Json
 $tenantId = $account.tenantId
 $senderDomain = ($SenderUpn -split '@')[-1]
+
+# Pin the tenant from the sender's domain, as the deploy does. Resource names
+# derive from the tenant id, so a mismatch would target another install.
+try {
+    $discovery = Invoke-RestMethod -Method Get -Uri "https://login.microsoftonline.com/$senderDomain/v2.0/.well-known/openid-configuration" -ErrorAction Stop
+    if ($discovery.issuer -match '([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+        $expectedTenantId = $Matches[1]
+        if ($expectedTenantId -ne $tenantId) {
+            throw "Subscription $SubscriptionId is in tenant $tenantId, but '$senderDomain' belongs to tenant $expectedTenantId. Refusing to update."
+        }
+    }
+}
+catch [System.Net.Http.HttpRequestException] {
+    Write-Warning "Could not resolve the tenant for '$senderDomain'; continuing with the current az context. Verify you are in the right tenant."
+}
 Write-Host "Subscription: $SubscriptionId  Tenant: $tenantId  (sender domain $senderDomain)"
 
 $stableSuffix = Get-StableSuffix -Seed $tenantId
@@ -104,6 +136,9 @@ $zipPath = Join-Path ([System.IO.Path]::GetTempPath()) "collaborate-$([Guid]::Ne
 $pkgStage = Join-Path ([System.IO.Path]::GetTempPath()) "cbpkg-$([Guid]::NewGuid().ToString('N'))"
 Copy-Item -Path $srcPath -Destination $pkgStage -Recurse -Force
 Get-ChildItem -Path $pkgStage -Filter 'local.settings.json*' -Recurse -Force | Remove-Item -Force -ErrorAction SilentlyContinue
+# The code must report the version it is, or the stale-code check on Diagnostics
+# compares CB_VERSION against a manifest nobody bumped and cries wolf.
+Set-CBPackageVersion -StagePath $pkgStage -Version $moduleVersion | Out-Null
 Compress-Archive -Path (Join-Path $pkgStage '*') -DestinationPath $zipPath -Force
 Remove-Item $pkgStage -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -127,7 +162,7 @@ else {
 Write-Step 'Reconciling permissions'
 $principalId = Get-AzScalar (Invoke-Az -AzArgs @('functionapp', 'identity', 'show', '--name', $AppName, '--resource-group', $ResourceGroup, '--query', 'principalId', '-o', 'tsv') -AllowFail)
 $graphRolesFailed = @()
-if ($principalId) { $graphRolesFailed = @(Update-CBPermission -PrincipalId $principalId) }
+if ($principalId) { $graphRolesFailed = @(Update-CBPermission -PrincipalId $principalId -PruneUnlisted:$PruneUnlistedPermissions) }
 else { Write-Warning 'Could not read the managed identity; skipping permission reconciliation.' }
 
 $appId = Get-AzScalar (Invoke-Az -AzArgs @('functionapp', 'config', 'appsettings', 'list', '--name', $AppName, '--resource-group', $ResourceGroup, '--query', "[?name=='CB_ADMIN_CLIENT_ID'].value | [0]", '-o', 'tsv') -AllowFail)
@@ -139,7 +174,7 @@ if ($appId -and $principalId) {
         # Keep the app roles current so a role added in a later release exists.
         Invoke-AzRestJson -Method PATCH -Uri "https://graph.microsoft.com/v1.0/applications/$appObjId" -Body @{ appRoles = @(Get-CBAppRoleDefinition) } -AllowFail | Out-Null
         $null = Set-CBFederatedCredential -AppObjectId $appObjId -PrincipalId $principalId -TenantId $tenantId
-        $delegatedFailed = @(Update-CBDelegatedPermission -AppId $appId -AppObjectId $appObjId -ServicePrincipalId $spId)
+        $delegatedFailed = @(Update-CBDelegatedPermission -AppId $appId -AppObjectId $appObjId -ServicePrincipalId $spId -PruneUnlisted:$PruneUnlistedPermissions)
     }
     else {
         # Skipping this silently is how a newly added scope looks reconciled and

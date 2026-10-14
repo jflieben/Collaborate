@@ -2,7 +2,8 @@
 
 Everything Collaborate needs is declared in
 [`deploy/permissions.json`](../deploy/permissions.json). Both the deploy and the
-update reconcile against that file.
+update reconcile against that file. Permissions that are granted but no longer
+listed are reported; pass `-PruneUnlistedPermissions` to remove them.
 
 There are three separate (automated) grants.
 
@@ -36,8 +37,7 @@ Used through the on-behalf-of flow, from the Function App:
 | `User.Read` | Identify the signed-in user on the delegated path |
 | `Sites.Read.All` | Find the SharePoint sites that user can already see, and their recent items |
 | `Files.ReadWrite.All` | Browse their files and grant a guest access to one, as them |
-| `TeamMember.ReadWrite.All` | Add a guest to a Team they own, as them |
-| `GroupMember.ReadWrite.All` | The group membership behind that Team add |
+| `GroupMember.ReadWrite.All` | Add a guest to a Team they own, as them, through the Team's group membership |
 | `Team.ReadBasic.All` | Read a Team's web address, so the guest gets a link straight into the Team. |
 
 And one on **SharePoint** rather than Graph, because Graph does not show this:

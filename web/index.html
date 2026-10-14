@@ -4,6 +4,9 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- No inline script anywhere. API and welcome site hosts are per tenant, so
+       they are allowed by suffix. frame-src is MSAL's silent renewal iframe. -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.web.core.windows.net https://*.blob.core.windows.net; connect-src 'self' https://*.azurewebsites.net https://login.microsoftonline.com https://graph.microsoft.com https://*.web.core.windows.net; frame-src https://login.microsoftonline.com; base-uri 'none'; form-action 'none'; object-src 'none'" />
   <title>Collaborate</title>
   <link rel="stylesheet" href="styles.css" />
   <!-- MSAL browser (delegated / authorization-code + PKCE). Bundled locally so
@@ -24,7 +27,7 @@
     <div class="card">
       <img id="gateLogo" class="logo" alt="" hidden />
       <h1 id="gateTitle">Collaborate</h1>
-      <p id="gateSubtitle" class="muted">Invite and manage the people you work with outside the company.</p>
+      <p id="gateSubtitle" class="muted">Invite and work with external people.</p>
       <p id="gateError" class="status bad" hidden></p>
       <p><button id="signInBtn" class="btn primary">Sign in</button></p>
       <p class="small muted">You will be signed in with your work account.</p>
@@ -50,20 +53,19 @@
   <main id="app" class="container" hidden>
     <div id="banners"></div>
 
-    <nav class="tabs" role="tablist">
-      <button class="tab active" data-view="home" role="tab">Home</button>
-      <button class="tab" data-view="guests" role="tab">Collaborators</button>
-      <button class="tab admin-only" data-view="config" role="tab" hidden>Configuration</button>
-      <button class="tab admin-only" data-view="branding" role="tab" hidden>Branding</button>
-      <button class="tab admin-only" data-view="emails" role="tab" hidden>Emails</button>
-      <button class="tab" data-view="log" role="tab">Activity</button>
-      <button class="tab admin-only" data-view="diag" role="tab" hidden>Diagnostics</button>
+    <nav class="tabs" aria-label="Sections">
+      <button class="tab active" data-view="home" aria-current="page">Home</button>
+      <button class="tab" data-view="guests">Collaborators</button>
+      <button class="tab admin-only" data-view="config" hidden>Configuration</button>
+      <button class="tab admin-only" data-view="branding" hidden>Branding</button>
+      <button class="tab admin-only" data-view="emails" hidden>Emails</button>
+      <button class="tab" data-view="log">Activity</button>
+      <button class="tab admin-only" data-view="diag" hidden>Diagnostics</button>
     </nav>
 
     <!-- ---------------- Home ---------------- -->
     <section id="view-home" class="view">
       <h1 id="homeHeading">What would you like to do?</h1>
-      <p class="muted" id="homeIntro">Everything you set up here is recorded against your name, with an end date, so nothing is left open forever.</p>
       <!-- Shown until /api/me answers. A cold start takes a few seconds, and an
            empty screen with no explanation reads as a broken page. -->
       <div class="card" id="homeLoading">
@@ -95,6 +97,11 @@
       <p id="guestsSignInNote" class="small muted" hidden></p>
       <p id="guestsCantInvite" class="status" hidden></p>
       <div class="card">
+        <div class="row">
+          <label class="sr-only" for="guestsSearch">Search collaborators</label>
+          <input id="guestsSearch" type="search" autocomplete="off" placeholder="Search by name, email or reason" style="flex:1;min-width:200px" />
+          <button id="guestsExport" class="btn small ghost">Download as CSV</button>
+        </div>
         <div class="row spread">
           <div id="guestsCounts" class="row small"></div>
           <label class="row small admin-only" hidden><input id="guestsAll" type="checkbox" /> Show every external account, not just mine</label>
@@ -112,11 +119,17 @@
           <div style="flex:1">
             <div class="title" id="guestsSelected"></div>
             <div class="row">
-              <input id="guestsOwner" type="text" autocomplete="off" placeholder="make this colleague responsible" style="flex:1;min-width:220px" />
+              <button id="guestsBulkRenew" class="btn small">Extend selected</button>
+              <button id="guestsBulkCancel" class="btn small">End access for selected</button>
+              <button id="guestsClearSel" class="btn small ghost">Clear</button>
+              <span id="guestsBulkStatus" class="status" role="status"></span>
+            </div>
+            <div id="guestsBulkConfirm"></div>
+            <div class="row" id="guestsAssignRow" style="margin-top:8px" hidden>
+              <input id="guestsOwner" type="text" autocomplete="off" placeholder="make this colleague responsible" aria-label="make this colleague responsible" style="flex:1;min-width:220px" />
               <input id="guestsOwnerId" type="hidden" />
               <button id="guestsAssign" class="btn small primary">Assign</button>
-              <button id="guestsClearSel" class="btn small ghost">Clear</button>
-              <span id="guestsAssignStatus" class="status"></span>
+              <span id="guestsAssignStatus" class="status" role="status"></span>
             </div>
             <div id="guestsOwnerMatches"></div>
           </div>
@@ -134,7 +147,7 @@
          contents rather than stacking another window over the top. -->
     <div id="guestDrawer" class="drawer" hidden>
       <div class="drawer-scrim" data-drawer-close></div>
-      <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="gdName">
+      <div class="drawer-panel" role="dialog" aria-modal="true" aria-labelledby="gdName" tabindex="-1">
         <header class="drawer-head">
           <div style="min-width:0">
             <h2 id="gdName"></h2>
@@ -396,6 +409,7 @@
       <div id="cfgWarnings"></div>
       <div class="row">
         <button id="cfgSave" class="btn primary">Save configuration</button>
+        <span id="cfgDirty" class="dirty" hidden>Unsaved changes</span>
         <span id="cfgStatus" class="status" role="status"></span>
       </div>
     </section>
@@ -450,6 +464,7 @@
 
       <div class="row">
         <button id="brSave" class="btn primary">Save and republish</button>
+        <span id="brDirty" class="dirty" hidden>Unsaved changes</span>
         <span id="brStatus" class="status" role="status"></span>
       </div>
     </section>
@@ -489,6 +504,7 @@
         <button id="emSave" class="btn primary">Save emails</button>
         <button id="emTest" class="btn">Send a test to me</button>
         <button id="emReset" class="btn ghost">Reset this message to default</button>
+        <span id="emDirty" class="dirty" hidden>Unsaved changes</span>
         <span id="emStatus" class="status" role="status"></span>
       </div>
     </section>
@@ -500,13 +516,16 @@
           <h2>Activity</h2>
           <label class="row small admin-only" hidden><input id="logAll" type="checkbox" /> Show everything, not just mine</label>
         </div>
+        <label class="field" for="logFilter"><span>Filter what is loaded</span>
+          <input id="logFilter" type="search" autocomplete="off" placeholder="name, event or detail" />
+        </label>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>When</th><th>What</th><th>Who</th><th>Details</th></tr></thead>
+            <thead><tr><th>When</th><th>What</th><th>Who</th><th>Collaborator</th><th>Details</th></tr></thead>
             <tbody id="logRows"></tbody>
           </table>
         </div>
-        <p class="row"><button id="logMore" class="btn small" hidden>Load more</button><span id="logStatus" class="status"></span></p>
+        <p class="row"><button id="logMore" class="btn small" hidden>Load more</button><span id="logStatus" class="status" role="status"></span></p>
       </div>
     </section>
 
@@ -540,13 +559,13 @@
         </div>
         <p class="small muted" id="diagEmpty" hidden>No background job has run yet.</p>
       </div>
-      <p><button id="diagRefresh" class="btn small">Refresh</button> <span id="diagStatus" class="status"></span></p>
+      <p><button id="diagRefresh" class="btn small">Refresh</button> <span id="diagStatus" class="status" role="status"></span></p>
     </section>
   </main>
 
   <!-- ---------------- Setup wizard ---------------- -->
   <div id="wizard" class="overlay" hidden>
-    <div class="card">
+    <div class="card" role="dialog" aria-modal="true" aria-labelledby="wizHeading" tabindex="-1">
       <div class="steps" id="wizSteps"></div>
       <div id="wizBody"></div>
       <div class="row spread" style="margin-top:16px">
@@ -563,7 +582,7 @@
     <span id="footVersion"></span><a href="https://jsolve.nl" target="_blank" rel="noopener noreferrer">Collaborate by JSolve B.V.</a>
   </footer>
 
-  <div id="toasts"></div>
+  <div id="toasts" aria-live="polite"></div>
   <script src="app.js"></script>
 </body>
 

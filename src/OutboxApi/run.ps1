@@ -47,6 +47,5 @@ try {
     Send-Json -Status 200 -Object @{ message = "$($result.Message)"; fellBack = [bool]$result.FellBack }
 }
 catch {
-    Write-Error "OutboxApi failed: $($_.Exception.Message)"
-    Send-Json -Status 500 -Object @{ error = $_.Exception.Message }
+    Send-Json -Status 500 -Object (Get-CBErrorResponse -Caller $caller -ErrorRecord $_ -Name 'OutboxApi')
 }

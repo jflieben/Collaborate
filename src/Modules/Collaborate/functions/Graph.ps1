@@ -49,6 +49,48 @@ function Get-CBGraphToken {
     return Get-CBManagedIdentityToken -Resource (Get-CBConfig).GraphResource
 }
 
+$script:CBJsonDateKind = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')
+
+function ConvertFrom-CBJsonText {
+    <#
+    .SYNOPSIS
+        ConvertFrom-Json that leaves timestamps as the strings they were.
+    .DESCRIPTION
+        Invoke-RestMethod turns every ISO timestamp into a local [datetime], and
+        "$x" then prints it as 'MM/dd/yyyy HH:mm:ss'. That is how Graph's
+        '0001-01-01T00:00:00Z' sentinel slipped past a string check and became
+        a guest idle for 739,000 days. Strings in, strings out.
+    #>
+    [CmdletBinding()] param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    if ($script:CBJsonDateKind) { return ($Text | ConvertFrom-Json -DateKind String) }
+    return ($Text | ConvertFrom-Json)
+}
+
+function Invoke-CBJsonRequest {
+    <#
+    .SYNOPSIS
+        One HTTP call with a JSON response, never throwing on an HTTP status.
+    .PARAMETER Request
+        Invoke-WebRequest parameters (Method or CustomMethod, Uri, Headers, Body).
+    .OUTPUTS
+        @{ StatusCode; Body; Headers } - Body is the parsed JSON, or the raw text
+        when it is not JSON.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)][hashtable]$Request)
+    $resp = Invoke-WebRequest @Request -SkipHttpErrorCheck -ErrorAction Stop
+    $text = $resp.Content
+    if ($text -is [byte[]]) { $text = [Text.Encoding]::UTF8.GetString($text) }
+    $body = $null
+    if (-not [string]::IsNullOrWhiteSpace($text)) {
+        try { $body = ConvertFrom-CBJsonText -Text $text } catch { $body = "$text" }
+    }
+    # Same header shape Invoke-RestMethod gave callers: name -> string[], any case.
+    $hdrs = [System.Collections.Generic.Dictionary[string, string[]]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($h in $resp.Headers.GetEnumerator()) { $hdrs[$h.Key] = @($h.Value) }
+    return [pscustomobject]@{ StatusCode = [int]$resp.StatusCode; Body = $body; Headers = $hdrs }
+}
+
 function Invoke-CBGraph {
     <#
     .SYNOPSIS
@@ -94,25 +136,28 @@ function Invoke-CBGraph {
         }
 
         $params = @{
-            Method                  = $Method
-            Uri                     = $Uri
-            Headers                 = $headers
-            ErrorAction             = 'Stop'
-            StatusCodeVariable      = 'statusCode'
-            SkipHttpErrorCheck      = $true
-            ResponseHeadersVariable = 'respHeaders'
+            Method  = $Method
+            Uri     = $Uri
+            Headers = $headers
         }
         if ($null -ne $Body) {
             $params.Body = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 20 -Compress }
         }
 
+        # Only 429 and 503 are retried for a POST: those mean "not processed".
+        # A 500 or 504 on sendMail or /invitations may have done the work, and
+        # repeating it sends the mail twice.
+        $retryable = if ($Method -eq 'Post') { @(429, 503) } else { @(429, 503, 504, 500) }
         $attempt = 0
         while ($true) {
             $attempt++
-            $response = Invoke-RestMethod @params
+            $result = Invoke-CBJsonRequest -Request $params
+            $statusCode = $result.StatusCode
+            $response = $result.Body
+            $respHeaders = $result.Headers
 
             # Throttling / transient server errors: honour Retry-After.
-            if ($statusCode -in @(429, 503, 504, 500) -and $attempt -le $MaxRetries) {
+            if ($statusCode -in $retryable -and $attempt -le $MaxRetries) {
                 $retryAfter = 0
                 if ($respHeaders -and $respHeaders['Retry-After']) {
                     [void][int]::TryParse(($respHeaders['Retry-After'] | Select-Object -First 1), [ref]$retryAfter)
@@ -260,9 +305,22 @@ function Get-CBSharePointHosts {
     [CmdletBinding()] param()
     if ($script:CBSpoHosts) { return $script:CBSpoHosts }
 
-    $root = Invoke-CBGraph -Uri '/sites/root?$select=webUrl'
-    if (-not $root.webUrl) { throw 'Could not resolve /sites/root to determine the SharePoint host.' }
-    $rootHost = ([Uri]$root.webUrl).Host                       # contoso.sharepoint.com
+    # /sites/root needs an application Sites permission the managed identity is
+    # deliberately not given, so the initial onmicrosoft.com domain is the
+    # fallback: it names the tenant, and the SharePoint host follows from it.
+    $rootHost = $null
+    try {
+        $root = Invoke-CBGraph -Uri '/sites/root?$select=webUrl'
+        if ($root.webUrl) { $rootHost = ([Uri]$root.webUrl).Host }
+    }
+    catch { Write-Verbose "No /sites/root as the managed identity: $($_.Exception.Message)" }
+    if (-not $rootHost) {
+        $initial = @(Invoke-CBGraph -Uri '/domains?$select=id,isInitial' -All | Where-Object { $_.isInitial } | Select-Object -First 1)
+        $name = if ($initial) { "$($initial[0].id)" } else { '' }
+        if ($name -notmatch '^([a-z0-9-]+)\.onmicrosoft\.com$') { throw 'Could not determine the SharePoint host for this tenant.' }
+        $rootHost = "$($Matches[1]).sharepoint.com"
+    }
+    $rootHost = $rootHost.ToLowerInvariant()                   # contoso.sharepoint.com
     $tenant   = $rootHost.Split('.')[0]                        # contoso
     $suffix   = $rootHost.Substring($tenant.Length)            # .sharepoint.com
     $script:CBSpoHosts = @($rootHost, ('{0}-my{1}' -f $tenant, $suffix))

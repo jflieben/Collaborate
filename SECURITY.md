@@ -9,7 +9,7 @@ change what every employee is allowed to do with external identities.
 
 | Boundary | Control |
 |---|---|
-| Who can sign in | Delegated Entra sign-in (MSAL). The API validates the bearer token itself (RS256 against tenant JWKS, audience, issuer, expiry) **and** refuses guest accounts and foreign tenants, so an invited guest can never open the portal. |
+| Who can sign in | Delegated Entra sign-in (MSAL). Every API function validates the bearer token itself (RS256 against the tenant JWKS, audience, exact issuer, tenant, expiry) and refuses app-only tokens, foreign tenants and any account whose `userType` in Entra is not `Member` (checked against the directory, cached per worker for an hour), so a guest can never open the portal. |
 | Who can administer | The `Collaborate.Admin` app role, assigned to a nominated security group. Checked from the token's `roles` claim on every admin call; the API fails closed. |
 | Who can invite | Optionally a nominated inviter group, resolved transitively server side. Never trusted from the client. |
 | What a user can share | The **user's own delegated token** (on-behalf-of), never the managed identity. Graph enforces the user's real rights on every browse and share call. |
@@ -28,10 +28,23 @@ change what every employee is allowed to do with external identities.
   until an admin turns simulation off.
 - **Grace before deletion.** Expiry blocks sign-in first and deletes only after a
   configurable grace period, so a mistake is recoverable.
-- **Defence in depth on every API.** Easy Auth is the platform gate; each
-  function independently validates the caller and fails closed.
+- **Every API validates the caller itself.** Easy Auth runs in
+  `AllowAnonymous` mode (a CORS preflight carries no token), so the token check
+  inside each function is the real gate, and it fails closed. Network
+  restrictions on the Function App are the outer layer.
+- **Accounts ended outside Collaborate stay ended.** A guest IT removed or
+  switched off directly in Entra can only be brought back by an administrator,
+  not by its owner.
 - **Everything is logged**, including who changed the configuration, with an
   old/new diff.
+
+## What the managed identity can do
+
+`User.ReadWrite.All` cannot be avoided (the expiry attribute, sign-in block and
+sponsor live on the user object), but it lets the identity change any
+non-administrator account, members included. Treat the Function App as a
+privileged workload: keep its network restrictions, and do not grant anyone
+code-deployment rights on it who could not be trusted with that permission.
 
 ## What the operator must do
 

@@ -249,7 +249,7 @@ Describe 'The installer and the deploy agree about the IP prompt' {
         $fn | Should -Match 'active = @\(\$byResource\.Keys'
     }
     It 'does not make the hint depend on the deploy script' {
-        # install.ps1 dot-sources CB.Common on its own, without Invoke-Az.
+        # The hint calls az directly, so it does not depend on Invoke-Az.
         $hint = [regex]::Match($common, '(?s)function Show-CBSignInIpHint.*?\n}').Value
         $hint | Should -Not -Match 'Invoke-Az\s+-AzArgs'
     }
@@ -330,6 +330,80 @@ Describe 'ConvertFrom-CBRequestBody' {
         $parsed.settings.dryRun | Should -BeFalse
         $parsed.settings.emails.invitation.subject | Should -Be $settings.emails.invitation.subject
         @($parsed.settings.expiry.reminderDays).Count | Should -Be 3
+    }
+}
+
+Describe 'Test-CBJwt' {
+    BeforeAll {
+        $script:tenant = '11111111-2222-3333-4444-555555555555'
+        $script:client = '99999999-8888-7777-6666-555555555555'
+        $env:CB_TENANT_ID = $script:tenant
+        $env:CB_ADMIN_CLIENT_ID = $script:client
+        $env:CB_SENDER_UPN = 'noreply@contoso.com'
+        $env:CB_TABLE_ENDPOINT = 'https://x.table.core.windows.net'
+        $env:CB_BLOB_ENDPOINT = 'https://x.blob.core.windows.net'
+        [void](Get-CBConfig -Refresh)
+
+        $script:rsa = [System.Security.Cryptography.RSA]::Create(2048)
+        $p = $script:rsa.ExportParameters($false)
+        function script:B64Url([byte[]]$b) { [Convert]::ToBase64String($b).TrimEnd('=').Replace('+', '-').Replace('/', '_') }
+        $script:jwk = [pscustomobject]@{ kid = 'k1'; n = (B64Url $p.Modulus); e = (B64Url $p.Exponent) }
+        function script:New-TestJwt([hashtable]$Claims, [string]$Kid = 'k1') {
+            $h = B64Url ([Text.Encoding]::UTF8.GetBytes((@{ alg = 'RS256'; kid = $Kid } | ConvertTo-Json -Compress)))
+            $c = B64Url ([Text.Encoding]::UTF8.GetBytes(($Claims | ConvertTo-Json -Compress)))
+            $sig = $script:rsa.SignData([Text.Encoding]::ASCII.GetBytes("$h.$c"),
+                [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+            return "$h.$c.$(B64Url $sig)"
+        }
+        function script:Get-GoodClaims {
+            $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            return @{ aud = "api://$($script:client)"; iss = "https://sts.windows.net/$($script:tenant)/"; tid = $script:tenant
+                exp = $now + 600; nbf = $now - 60; oid = 'abc'; scp = 'user_impersonation' }
+        }
+    }
+    BeforeEach { Mock -ModuleName Collaborate Get-CBJwks { @($script:jwk) } }
+    AfterAll {
+        foreach ($n in 'CB_TENANT_ID', 'CB_ADMIN_CLIENT_ID', 'CB_SENDER_UPN', 'CB_TABLE_ENDPOINT', 'CB_BLOB_ENDPOINT') {
+            [Environment]::SetEnvironmentVariable($n, $null)
+        }
+        # Later tests expect the unconfigured state, so drop the cached config.
+        & (Get-Module Collaborate) { $script:CBConfigCache = $null }
+    }
+
+    It 'accepts a valid token' { (Test-CBJwt -Token (New-TestJwt (Get-GoodClaims))).Valid | Should -BeTrue }
+    It 'accepts the v2 issuer' {
+        $c = Get-GoodClaims; $c.iss = "https://login.microsoftonline.com/$($script:tenant)/v2.0"
+        (Test-CBJwt -Token (New-TestJwt $c)).Valid | Should -BeTrue
+    }
+    It 'refuses an issuer that merely contains the tenant id' {
+        $c = Get-GoodClaims; $c.iss = "https://evil.example/$($script:tenant)/"
+        (Test-CBJwt -Token (New-TestJwt $c)).Valid | Should -BeFalse
+    }
+    It 'refuses a token with no expiry' {
+        $c = Get-GoodClaims; $c.Remove('exp')
+        (Test-CBJwt -Token (New-TestJwt $c)).Valid | Should -BeFalse
+    }
+    It 'refuses a token with no tenant' {
+        $c = Get-GoodClaims; $c.Remove('tid')
+        (Test-CBJwt -Token (New-TestJwt $c)).Valid | Should -BeFalse
+    }
+    It 'refuses an expired token' {
+        $c = Get-GoodClaims; $c.exp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 3600
+        (Test-CBJwt -Token (New-TestJwt $c)).Valid | Should -BeFalse
+    }
+    It 'refuses another audience' {
+        $c = Get-GoodClaims; $c.aud = 'api://someone-else'
+        (Test-CBJwt -Token (New-TestJwt $c)).Valid | Should -BeFalse
+    }
+    It 'refuses a tampered payload' {
+        $parts = (New-TestJwt (Get-GoodClaims)).Split('.')
+        $other = (New-TestJwt ((Get-GoodClaims) + @{ roles = @('Collaborate.Admin') })).Split('.')
+        (Test-CBJwt -Token "$($parts[0]).$($other[1]).$($parts[2])").Valid | Should -BeFalse
+    }
+    It 'refuses alg none' {
+        $parts = (New-TestJwt (Get-GoodClaims)).Split('.')
+        $none = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('{"alg":"none","kid":"k1"}')).TrimEnd('=')
+        (Test-CBJwt -Token "$none.$($parts[1]).$($parts[2])").Valid | Should -BeFalse
     }
 }
 
@@ -1987,6 +2061,194 @@ Describe 'The portal and the API agree on which languages exist' {
         $js = Get-Content (Join-Path $PSScriptRoot '..\web\i18n.js') -Raw
         foreach ($code in (Get-CBLanguages | Where-Object { $_ -ne 'en' })) {
             $js | Should -Match ("DICTIONARIES\s*=\s*\{[^}]*\b$code\s*:")
+        }
+    }
+}
+
+Describe 'Set-CBPackageVersion' {
+    # The version reached the CB_VERSION app setting but never the module
+    # manifest, so Diagnostics compared 0.7.0 against a manifest still saying
+    # 0.5.0 and reported a failed deployment on every healthy install.
+    BeforeAll {
+        . (Join-Path $PSScriptRoot '..\deploy\CB.Common.ps1')
+        function New-Stage {
+            param([string]$Version = '0.5.0')
+            $stage = Join-Path ([IO.Path]::GetTempPath()) ("cbtest-" + [guid]::NewGuid().ToString('N'))
+            $dir = Join-Path $stage 'Modules/Collaborate'
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            Set-Content -Path (Join-Path $dir 'Collaborate.psd1') -Encoding utf8 -Value @(
+                '@{'
+                "    ModuleVersion     = '$Version'"
+                "    RootModule        = 'Collaborate.psm1'"
+                '}'
+            )
+            return $stage
+        }
+    }
+
+    It 'writes the release version into the staged manifest' {
+        $stage = New-Stage
+        try {
+            Set-CBPackageVersion -StagePath $stage -Version '0.7.0' | Should -Be '0.7.0'
+            $text = Get-Content (Join-Path $stage 'Modules/Collaborate/Collaborate.psd1') -Raw
+            $text | Should -Match "ModuleVersion\s*=\s*'0\.7\.0'"
+            $text | Should -Not -Match "0\.5\.0"
+        }
+        finally { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'leaves a manifest that already matches alone' {
+        $stage = New-Stage -Version '0.7.0'
+        try {
+            { Set-CBPackageVersion -StagePath $stage -Version '0.7.0' } | Should -Not -Throw
+            (Get-Content (Join-Path $stage 'Modules/Collaborate/Collaborate.psd1') -Raw) | Should -Match "'0\.7\.0'"
+        }
+        finally { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'refuses a version a module manifest cannot hold' {
+        $stage = New-Stage
+        try { { Set-CBPackageVersion -StagePath $stage -Version '0.7.0-beta' } | Should -Throw '*two to four numbers*' }
+        finally { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    It 'says so when there is no manifest to stamp' {
+        $stage = Join-Path ([IO.Path]::GetTempPath()) ("cbtest-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $stage -Force | Out-Null
+        try { { Set-CBPackageVersion -StagePath $stage -Version '0.7.0' } | Should -Throw '*no module manifest*' }
+        finally { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+Describe 'The shipped package reports the version it is' {
+    It 'stamps the manifest before zipping, in both deploy paths' {
+        foreach ($name in @('Deploy-Collaborate.ps1', 'Update-Collaborate.ps1')) {
+            $text = Get-Content (Join-Path $PSScriptRoot "..\deploy\$name") -Raw
+            $stamp = $text.IndexOf('Set-CBPackageVersion')
+            $zip = $text.IndexOf('Compress-Archive')
+            $stamp | Should -BeGreaterThan 0 -Because "$name must stamp the staged manifest"
+            $stamp | Should -BeLessThan $zip -Because "$name must stamp before it zips"
+            # The helper lives in CB.Common.ps1, which must already be loaded.
+            $text.IndexOf('CB.Common.ps1') | Should -BeLessThan $stamp
+        }
+    }
+    It 'has a committed manifest matching VERSION, so a local import is honest too' {
+        $version = (Get-Content (Join-Path $PSScriptRoot '..\VERSION') -Raw).Trim()
+        $manifest = Get-Content (Join-Path $PSScriptRoot '..\src\Modules\Collaborate\Collaborate.psd1') -Raw
+        $manifest | Should -Match "ModuleVersion\s*=\s*'$([regex]::Escape($version))'"
+    }
+}
+
+Describe 'Review round 2026-10-14' {
+    BeforeAll {
+        function New-Settings([scriptblock]$Change) {
+            $raw = Get-CBDefaultSettings
+            if ($Change) { & $Change $raw }
+            return [pscustomobject](ConvertTo-CBSanitisedSettings -Raw ([pscustomobject]$raw))
+        }
+        $now = [datetime]::new(2026, 6, 1, 0, 0, 0, [DateTimeKind]::Utc)
+    }
+
+    Context 'Timestamps stay strings' {
+        It 'leaves an ISO timestamp as the string it was' {
+            $o = ConvertFrom-CBJsonText -Text '{"when":"2026-10-14T06:30:00Z","never":"0001-01-01T00:00:00Z"}'
+            $o.when | Should -BeOfType [string]
+            $o.never | Should -Be '0001-01-01T00:00:00Z'
+        }
+        It 'treats empty text as nothing' { ConvertFrom-CBJsonText -Text '' | Should -BeNullOrEmpty }
+    }
+
+    Context 'Adoption end dates' {
+        BeforeAll { $s = New-Settings { param($r) $r.adoption.initialDays = 60; $r.expiry.reminderDays = @(30, 7, 1); $r.expiry.attribute = 'extensionAttribute15' } }
+        It 'moves a date that has already passed out past every reminder' {
+            $user = [pscustomobject]@{ id = 'g1'; onPremisesExtensionAttributes = [pscustomobject]@{ extensionAttribute15 = '2026-05-01' } }
+            (Get-CBAdoptionExpiry -User $user -Settings $s -Now $now).ExpiresOn | Should -Be '2026-07-02'
+        }
+        It 'moves a date inside the reminder window' {
+            $user = [pscustomobject]@{ id = 'g1'; onPremisesExtensionAttributes = [pscustomobject]@{ extensionAttribute15 = '2026-06-10' } }
+            (Get-CBAdoptionExpiry -User $user -Settings $s -Now $now).ExpiresOn | Should -Be '2026-07-02'
+        }
+        It 'spreads new dates deterministically within the window' {
+            $dates = 1..40 | ForEach-Object { (Get-CBAdoptionExpiry -User ([pscustomobject]@{ id = [Guid]::NewGuid().ToString() }) -Settings $s -Now $now -SpreadDays 10).ExpiresOn }
+            @($dates | Sort-Object -Unique).Count | Should -BeGreaterThan 3
+            @($dates | Where-Object { $_ -lt '2026-07-31' -or $_ -gt '2026-08-09' }).Count | Should -Be 0
+            $u = [pscustomobject]@{ id = 'fixed-id' }
+            (Get-CBAdoptionExpiry -User $u -Settings $s -Now $now -SpreadDays 10).ExpiresOn |
+                Should -Be (Get-CBAdoptionExpiry -User $u -Settings $s -Now $now -SpreadDays 10).ExpiresOn
+        }
+    }
+
+    Context 'Lifecycle with no grace period' {
+        It 'deletes on the day access ended, so the queued removal is not a no-op' {
+            $s = New-Settings { param($r) $r.expiry.graceDays = 0 }
+            $row = [pscustomobject]@{ PartitionKey = 'o'; RowKey = 'g'; State = 'blocked'; ExpiresOn = '2026-06-01'; GraceUntil = '2026-06-01' }
+            (Get-CBLifecycleAction -Row $row -Settings $s -Now $now).Action | Should -Be 'delete'
+        }
+        It 'still waits out a real grace period' {
+            $s = New-Settings { param($r) $r.expiry.graceDays = 14 }
+            $row = [pscustomobject]@{ PartitionKey = 'o'; RowKey = 'g'; State = 'blocked'; ExpiresOn = '2026-05-20'; GraceUntil = '2026-06-01' }
+            (Get-CBLifecycleAction -Row $row -Settings $s -Now $now).Action | Should -Be 'none'
+        }
+    }
+
+    Context 'Accounts ended outside Collaborate' {
+        BeforeAll {
+            $s = New-Settings
+            $owner = @{ Oid = 'o'; IsAdmin = $false }
+            $admin = @{ Oid = 'a'; IsAdmin = $true }
+        }
+        It 'refuses the owner and allows an administrator' {
+            $row = [pscustomobject]@{ State = 'deleted'; EndedOutside = 'true'; RenewCount = '0' }
+            (Test-CBRenewAllowed -Row $row -Caller $owner -Settings $s).Allowed | Should -BeFalse
+            (Test-CBRenewAllowed -Row $row -Caller $admin -Settings $s).Allowed | Should -BeTrue
+        }
+        It 'does not affect a guest Collaborate itself blocked' {
+            $row = [pscustomobject]@{ State = 'blocked'; EndedOutside = ''; RenewCount = '0' }
+            (Test-CBRenewAllowed -Row $row -Caller $owner -Settings $s).Allowed | Should -BeTrue
+        }
+    }
+
+    Context 'Welcome page allowlist wildcards' {
+        It 'refuses subdomain wildcards on shared suffixes' {
+            (ConvertTo-CBHostList -Value @('.sharepoint.com', '.co.uk', '.azurewebsites.net', '.github.io')).Count | Should -Be 0
+        }
+        It 'keeps an organisation''s own wildcard and exact hosts' {
+            (ConvertTo-CBHostList -Value @('.partners.contoso.com', 'contoso.sharepoint.com')) -join ',' | Should -Be '.partners.contoso.com,contoso.sharepoint.com'
+        }
+    }
+
+    Context 'Graph error status' {
+        It 'reads the status from a Graph error' { Get-CBHttpStatusFromError -ErrorRecord 'Graph PATCH returned HTTP 403: Insufficient privileges' | Should -Be 403 }
+        It 'is 0 when there is none' { Get-CBHttpStatusFromError -ErrorRecord 'timeout' | Should -Be 0 }
+    }
+
+    Context 'Share events in the activity log' {
+        It 'files a share under the owner only when the owner shared it' {
+            Get-CBShareLogOwner -Caller @{ Oid = 'o1' } -OwnerId 'o1' | Should -Be 'o1'
+            Get-CBShareLogOwner -Caller @{ Oid = 'o2' } -OwnerId 'o1' | Should -Be ''
+        }
+    }
+
+    Context 'Storm guard' {
+        It 'refuses invitations at the cap without pausing everything' {
+            Mock -ModuleName Collaborate Test-CBPaused { $false }
+            Mock -ModuleName Collaborate Get-CBSafetyCount { 50 }
+            Mock -ModuleName Collaborate Set-CBPaused { }
+            Mock -ModuleName Collaborate Add-CBSafetyCount { 0 }
+            $s = New-Settings { param($r) $r.safety.enabled = $true; $r.safety.dailyCapInvite = 50 }
+            $g = Test-CBStormGuard -Action 'invite' -Settings $s
+            $g.Allowed | Should -BeFalse
+            $g.Paused | Should -BeFalse
+            Should -Invoke -ModuleName Collaborate Set-CBPaused -Times 0
+        }
+        It 'still pauses on the block cap' {
+            Mock -ModuleName Collaborate Test-CBPaused { $false }
+            Mock -ModuleName Collaborate Get-CBSafetyCount { 100 }
+            Mock -ModuleName Collaborate Set-CBPaused { }
+            Mock -ModuleName Collaborate Add-CBSafetyCount { 0 }
+            $s = New-Settings { param($r) $r.safety.enabled = $true; $r.safety.dailyCapBlock = 100 }
+            (Test-CBStormGuard -Action 'block' -Settings $s).Paused | Should -BeTrue
+            Should -Invoke -ModuleName Collaborate Set-CBPaused -Times 1
         }
     }
 }

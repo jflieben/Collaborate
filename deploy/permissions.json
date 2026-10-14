@@ -19,8 +19,7 @@
     { "resource": "graph", "value": "User.Read", "reason": "identify the signed-in user on the delegated path" },
     { "resource": "graph", "value": "Sites.Read.All", "reason": "find the SharePoint sites the user can already see, for the picker" },
     { "resource": "graph", "value": "Files.ReadWrite.All", "reason": "browse the user's own files and grant a guest access to one of them, as that user" },
-    { "resource": "graph", "value": "TeamMember.ReadWrite.All", "reason": "add a guest to a Team the user owns, as that user" },
-    { "resource": "graph", "value": "GroupMember.ReadWrite.All", "reason": "the group membership behind a Team add, as that user" },
+    { "resource": "graph", "value": "GroupMember.ReadWrite.All", "reason": "add a guest to a Team the user owns, as that user, through the Team's group membership" },
     { "resource": "graph", "value": "Team.ReadBasic.All", "reason": "read a Team's web address so the guest gets a link straight into it rather than the generic Teams page; the tool works without this and falls back" },
     { "resource": "sharepoint", "value": "AllSites.Read", "usedBy": "sharepoint", "reason": "read a site's own settings (external sharing, lock state) as the signed-in user. Graph does not expose them, and the tenant admin API needs SharePoint administrator rights an employee does not have. Read-only" },
     { "resource": "graph", "value": "Mail.Send", "usedBy": "browser", "reason": "send an invitation from the inviter's own mailbox, when the tenant has chosen that. Requested by the PORTAL in the browser, never by the Function App: a delegated Mail.Send used server-side would appear to Conditional Access as a sign-in from a datacentre, and an application Mail.Send on the managed identity would let this tool send as anybody" }

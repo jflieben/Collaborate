@@ -24,7 +24,6 @@ $script:CBTokenExchangeAudience = 'api://AzureADTokenExchange'
 $script:CBOboScopes = @(
     'https://graph.microsoft.com/Files.ReadWrite.All',
     'https://graph.microsoft.com/Sites.Read.All',
-    'https://graph.microsoft.com/TeamMember.ReadWrite.All',
     'https://graph.microsoft.com/GroupMember.ReadWrite.All',
     'https://graph.microsoft.com/Team.ReadBasic.All',
     'https://graph.microsoft.com/User.Read'

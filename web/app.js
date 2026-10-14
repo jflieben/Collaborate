@@ -12,6 +12,12 @@
 (function () {
   "use strict";
 
+  // Framed (clickjacking, or MSAL's silent renewal iframe): render nothing.
+  if (window.top !== window.self) {
+    document.documentElement.hidden = true;
+    return;
+  }
+
   var CFG = window.CB_AUTH || {};
   var el = function (id) { return document.getElementById(id); };
   var state = {
@@ -24,7 +30,9 @@
     share: null,       // { mode, step, target, recipient, newGuest, crumb, pane }
     emailKey: "",      // template being edited
     logNext: null,     // activity log continuation
-    wizard: null       // { settings, step }
+    wizard: null,      // { settings, step }
+    view: "home",      // the view on screen
+    emailDrafts: {}    // unsaved template edits, by key; state.config holds the saved ones
   };
 
   /* ---------------- language ----------------
@@ -107,6 +115,7 @@
     if (!host) { return; }
     var t = document.createElement("div");
     t.className = "toast " + (kind || "");
+    if (kind === "bad") { t.setAttribute("role", "alert"); }
     t.innerHTML = '<div>' + esc(message) + '</div><button class="toast-close" aria-label="Dismiss">&times;</button>';
     host.appendChild(t);
     function close() { t.classList.add("out"); setTimeout(function () { if (t.parentNode) { t.parentNode.removeChild(t); } }, 260); }
@@ -173,6 +182,31 @@
   function truthy(v) {
     if (typeof v === "string") { return !(v === "" || v.toLowerCase() === "false" || v === "0"); }
     return !!v;
+  }
+
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+
+  // Disables a button while the promise it started runs, so a double click
+  // cannot send the same request twice.
+  function whileBusy(btn, start) {
+    if (!btn || btn.disabled) { return Promise.resolve(); }
+    btn.disabled = true;
+    var p;
+    try { p = Promise.resolve(start()); } catch (e) { p = Promise.reject(e); }
+    return p.then(function (r) { btn.disabled = false; return r; },
+      function (e) { btn.disabled = false; throw e; });
+  }
+
+  // Keeps Tab inside a dialog.
+  function trapTab(container, e) {
+    if (e.key !== "Tab") { return; }
+    var nodes = Array.prototype.slice.call(container.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'))
+      .filter(function (n) { return n.offsetParent !== null; });
+    if (!nodes.length) { e.preventDefault(); container.focus(); return; }
+    var first = nodes[0], last = nodes[nodes.length - 1];
+    if (e.shiftKey && (document.activeElement === first || document.activeElement === container)) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
   }
 
   /* ---------------- branding ---------------- */
@@ -324,12 +358,56 @@
     return all && all.length ? all[0] : null;
   }
 
+  // The deep link somebody arrived on, kept across the sign-in redirect.
+  var HASH_KEY = "cb.returnHash";
+  function rememberHash() {
+    try { if (window.location.hash) { window.sessionStorage.setItem(HASH_KEY, window.location.hash); } } catch (e) { }
+  }
+  function restoreHash() {
+    var saved = "";
+    try { saved = window.sessionStorage.getItem(HASH_KEY) || ""; window.sessionStorage.removeItem(HASH_KEY); } catch (e) { }
+    if (saved && !parseHash(window.location.hash).known) {
+      window.history.replaceState(null, "", window.location.pathname + window.location.search + saved);
+    }
+  }
+
+  function signInRedirect() {
+    rememberHash();
+    return msalInstance.loginRedirect(loginRequest);
+  }
+
+  // Only these mean a person has to sign in again. Anything else (a network
+  // blip, a timed-out iframe) gets one silent retry and then fails as an error,
+  // rather than redirecting away from a half-finished form.
+  var INTERACTION_CODES = ["interaction_required", "login_required", "consent_required", "no_tokens_found",
+    "refresh_token_expired", "bad_token", "native_account_unavailable", "token_refresh_required"];
+  function needsInteraction(e) {
+    if (!e) { return false; }
+    if (msal.InteractionRequiredAuthError && e instanceof msal.InteractionRequiredAuthError) { return true; }
+    return INTERACTION_CODES.indexOf(String(e.errorCode || "")) >= 0;
+  }
+
   function getToken() {
     var acc = currentAccount();
-    if (!acc) { return Promise.reject(new Error("Not signed in.")); }
-    return msalInstance.acquireTokenSilent({ scopes: [CFG.apiScope], account: acc })
-      .then(function (r) { return r.accessToken; })
-      .catch(function () { return msalInstance.acquireTokenRedirect(loginRequest); });
+    if (!acc) { return Promise.reject(new Error(t("You are not signed in."))); }
+    var request = { scopes: [CFG.apiScope], account: acc };
+    return msalInstance.acquireTokenSilent(request)
+      .catch(function (e) {
+        if (needsInteraction(e)) { throw e; }
+        return msalInstance.acquireTokenSilent(request);
+      })
+      .then(function (r) {
+        if (!r || !r.accessToken) { throw new Error(t("Could not get a sign-in token. Reload the page and try again.")); }
+        return r.accessToken;
+      })
+      .catch(function (e) {
+        if (!needsInteraction(e)) { throw e; }
+        rememberHash();
+        // Navigates away; the rejection keeps api() from sending a request
+        // without a token in the moment before it does.
+        return msalInstance.acquireTokenRedirect({ scopes: [CFG.apiScope], account: acc })
+          .then(function () { throw new Error(t("Your session has expired. Signing you in again...")); });
+      });
   }
 
   /* ---------------- sending as yourself ----------------
@@ -349,7 +427,7 @@
 
   function getGraphSendToken() {
     var acc = currentAccount();
-    if (!acc) { return Promise.reject(new Error("Not signed in.")); }
+    if (!acc) { return Promise.reject(new Error(t("You are not signed in."))); }
     return msalInstance.acquireTokenSilent({ scopes: [GRAPH_SEND_SCOPE], account: acc })
       .then(function (r) { return r.accessToken; })
       .catch(function () {
@@ -415,7 +493,7 @@
       }).then(function (res) {
         return res.json().catch(function () { return {}; }).then(function (data) {
           if (!res.ok) {
-            var err = new Error(data.error || ("The server returned " + res.status + "."));
+            var err = new Error(data.error || t("The server returned {status}.", { status: res.status }));
             err.status = res.status;
             err.data = data;
             throw err;
@@ -428,15 +506,76 @@
 
   /* ---------------- views ---------------- */
 
-  function showView(name) {
+  var ADMIN_VIEWS = { config: 1, branding: 1, emails: 1, diag: 1 };
+  var HASH_VIEWS = { home: 1, guests: 1, config: 1, branding: 1, emails: 1, log: 1, diag: 1, share: 1, invite: 1 };
+
+  // #guests, #config, ... and #guest/<id> or #guest/<id>/<action>.
+  function parseHash(hash) {
+    var parts = String(hash || "").replace(/^#\/?/, "").split("/");
+    if (parts[0] === "guest" && /^[0-9a-fA-F-]{36}$/.test(parts[1] || "")) {
+      return { known: true, view: "guests", guestId: parts[1], action: parts[2] || "" };
+    }
+    if (HASH_VIEWS[parts[0]]) { return { known: true, view: parts[0], mode: parts[1] || "" }; }
+    return { known: false, view: "home" };
+  }
+
+  // Pushes a history entry, so Back works. Routing ignores the resulting
+  // hashchange because the view is already on screen.
+  function setHash(hash, replace) {
+    if (window.location.hash === hash) { return; }
+    if (replace) { window.history.replaceState(null, "", hash); }
+    else { window.location.hash = hash; }
+  }
+
+  // keepHash: the caller owns the hash (a deep link to one collaborator).
+  function showView(name, keepHash) {
+    // Nothing but Home can render before /api/me has answered; the hash keeps
+    // the request and route() picks it up once it has.
+    if (!state.me && name !== "home") {
+      if (HASH_VIEWS[name]) { setHash("#" + name); }
+      return;
+    }
+    if (ADMIN_VIEWS[name] && !(state.me && state.me.user.isAdmin)) { name = "home"; }
+    var previous = state.view;
+    state.view = name;
+    if (previous === "branding" && name !== "branding") { revertBrandPreview(); }
+    if (HASH_VIEWS[name] && !keepHash) { setHash("#" + (name === "share" && state.share && state.share.mode === "teams" ? "share/teams" : name)); }
     document.querySelectorAll(".view").forEach(function (v) { v.hidden = v.id !== "view-" + name; });
-    document.querySelectorAll(".tab").forEach(function (t) { t.classList.toggle("active", t.dataset.view === name); });
+    document.querySelectorAll(".tab").forEach(function (b) {
+      var on = b.dataset.view === name;
+      b.classList.toggle("active", on);
+      if (on) { b.setAttribute("aria-current", "page"); } else { b.removeAttribute("aria-current"); }
+    });
     if (name === "guests") { loadGuests(); }
-    if (name === "config") { loadConfig(); }
-    if (name === "branding") { loadConfig().then(renderBranding); }
-    if (name === "emails") { loadConfig().then(renderEmails); }
+    if (name === "config" || name === "branding" || name === "emails") { enterAdminTab(name); }
     if (name === "log") { loadLog(true); }
     if (name === "diag") { loadDiagnostics(); }
+  }
+
+  // Applies the hash: on first load after /api/me, on hashchange and on Back.
+  function route() {
+    if (!state.me) { return; }
+    var h = parseHash(window.location.hash);
+    if (h.guestId) {
+      if (state.drawer && state.drawer.guest.id === h.guestId) { return; }
+      if (state.view !== "guests") { showView("guests", true); }
+      openGuest({ id: h.guestId }, h.action);
+      return;
+    }
+    if (state.drawer) { closeGuest(true); }
+    if (h.view === state.view && el("view-" + h.view) && !el("view-" + h.view).hidden) { return; }
+    if (h.view === "share") {
+      var caps = state.me.capabilities || {};
+      if (h.mode === "teams" && truthy(caps.shareTeams)) { startShare("teams"); return; }
+      if ((truthy(caps.shareFiles) || truthy(caps.shareFolders)) && sharingAllowed().ok) { startShare("files"); return; }
+      showView("home");
+      return;
+    }
+    if (h.view === "invite") {
+      if (state.me.canInvite && state.me.canInvite.allowed) { startInvite(); } else { showView("guests"); }
+      return;
+    }
+    showView(h.view);
   }
 
   // Buttons rendered after boot (inside a verdict card, say) need wiring too, so
@@ -464,16 +603,35 @@
         var btn = document.createElement("button");
         btn.className = "btn small";
         btn.textContent = b.actionLabel || "Resume";
-        btn.onclick = function () {
-          btn.disabled = true;
-          api("/resume", "POST", {})
-            .then(function () { toast("Processing resumed.", "ok"); return loadMe(); })
-            .catch(function (e) { toast(e.message, "bad"); btn.disabled = false; });
-        };
+        // A second step: resuming also resets today's safety counters, so it
+        // must not be one stray click.
+        btn.onclick = function () { confirmResume(div, b); };
         div.appendChild(btn);
       }
       host.appendChild(div);
     });
+  }
+
+  function confirmResume(div, b) {
+    div.innerHTML = '<div style="flex:1"><div class="title">' + esc(t("Resume processing?")) + "</div>" +
+      '<div class="small">' + esc(t("It paused because: {reason}", { reason: b.message || t("no reason was recorded") })) + "</div>" +
+      '<div class="small">' + esc(t("Resuming lets everything that is queued go ahead now, and resets today's safety counters. Check the reason above first.")) + "</div>" +
+      '<div class="row" style="margin-top:10px">' +
+      '<button type="button" class="btn small primary" data-resume-go>' + esc(t("Resume now")) + "</button>" +
+      '<button type="button" class="btn small ghost" data-resume-cancel>' + esc(t("Cancel")) + "</button>" +
+      '<span class="status" role="status" data-resume-status></span></div></div>';
+    var go = div.querySelector("[data-resume-go]");
+    go.focus();
+    div.querySelector("[data-resume-cancel]").onclick = function () { renderBanners(state.me ? state.me.banners : []); };
+    go.onclick = function () {
+      whileBusy(go, function () {
+        return api("/resume", "POST", {})
+          .then(function () { toast(t("Processing resumed."), "ok"); return loadMe(); });
+      }).catch(function (e) {
+        var st = div.querySelector("[data-resume-status]");
+        if (st) { st.className = "status bad"; st.textContent = e.message; }
+      });
+    };
   }
 
   // Drawn for these three actions rather than borrowed emoji. A dashed stroke
@@ -521,7 +679,7 @@
         icon: "share",
         // Says what this tenant actually allows, rather than promising something
         // the next screen refuses.
-        label: "Share a " + shareLabel(),
+        label: t({ "file": "Share a file", "folder": "Share a folder" }[shareLabel()] || "Share a file or folder"),
         hint: "Pick something from SharePoint or your OneDrive and give an outsider access to just that.",
         // SharePoint's own tenant setting counts as much as ours: with it off,
         // every share fails, and finding that out after picking a file and a
@@ -558,12 +716,16 @@
       host.appendChild(btn);
     });
 
-    if (!me.canInvite.allowed) {
-      var note = document.createElement("p");
+    // Rendered on every /api/me, so one note, reused.
+    var note = el("homeCantInvite");
+    if (!note) {
+      note = document.createElement("p");
+      note.id = "homeCantInvite";
       note.className = "muted small";
-      note.textContent = me.canInvite.reason;
       host.parentNode.appendChild(note);
     }
+    note.hidden = !!me.canInvite.allowed;
+    note.textContent = me.canInvite.allowed ? "" : (me.canInvite.reason || "");
 
     // The same rule on the collaborators screen: the invite button is hidden
     // rather than offered and then refused.
@@ -592,15 +754,18 @@
 
   function loadMe() {
     return api("/me").then(function (data) {
+      var first = !state.me;
       state.me = data;
       reconcileLanguage(data);
       renderShell();
-      if (!data.setupComplete && data.user.isAdmin) { startWizard(); }
+      if (!data.setupComplete && data.user.isAdmin && first) { startWizard(); }
+      // A deep link, or a tab clicked while this was loading.
+      if (first) { route(); }
       return data;
     }).catch(function (e) {
       // Without /me there is nothing to render, so say so where the cards would
       // have been rather than leaving the spinner turning forever.
-      el("homeLoading").innerHTML = '<p class="status bad">Collaborate could not start: ' + esc(e.message) + "</p>" +
+      el("homeLoading").innerHTML = '<p class="status bad">' + esc(t("Collaborate could not start: {error}", { error: e.message })) + "</p>" +
         '<p class="small muted">If this persists, an administrator can check the Function App is running.</p>';
       el("homeLoading").hidden = false;
       throw e;
@@ -647,6 +812,7 @@
   }
 
   function loadGuests() {
+    if (!state.me) { return Promise.resolve(); }
     var showAll = !!(state.me.user.isAdmin && el("guestsAll") && el("guestsAll").checked);
     setStatus("guestsStatus", "Loading...");
     state.selected = {};
@@ -680,6 +846,12 @@
     return GUEST_STATES.length;
   }
 
+  // The one wording for a state, in the pill and in the filter alike.
+  function stateLabel(s) {
+    for (var i = 0; i < GUEST_STATES.length; i++) { if (GUEST_STATES[i][0] === s) { return t(GUEST_STATES[i][1]); } }
+    return t(String(s || ""));
+  }
+
   function guestFilterState() {
     if (!state.guestFilter) { state.guestFilter = { who: "", states: [] }; }
     return state.guestFilter;
@@ -689,6 +861,7 @@
     var f = guestFilterState();
     var unownedOnly = state.guestsShowAll && el("guestsUnowned").checked;
     var term = f.who.trim().toLowerCase();
+    var search = String(state.guestSearch || "").trim().toLowerCase();
     return items.filter(function (g) {
       if (f.states.length && f.states.indexOf(g.state) < 0) { return false; }
       if (unownedOnly && !g.orphaned) { return false; }
@@ -696,6 +869,7 @@
         var hay = [g.displayName, g.email, g.reason, g.owner ? g.owner.displayName : ""].join(" ").toLowerCase();
         if (hay.indexOf(term) < 0) { return false; }
       }
+      if (search && [g.displayName, g.email, g.reason].join(" ").toLowerCase().indexOf(search) < 0) { return false; }
       return true;
     });
   }
@@ -737,15 +911,20 @@
     return '<span class="sort-mark on" aria-hidden="true">' + (s.dir === "desc" ? "↓" : "↑") + "</span>";
   }
 
+  // The label is translated here: the sweep cannot match a button whose text
+  // shares it with the sort mark.
   function headerCell(key, label, filterable) {
     var f = guestFilterState();
     var active = (key === "status" && f.states.length) || (key === "who" && f.who);
-    return "<th>" +
-      '<button type="button" class="th-sort" data-sort="' + key + '" title="Sort by ' + esc(label) + '">' +
-      esc(label) + sortIndicator(key) + "</button>" +
+    var s = state.guestSort;
+    var sort = (s && s.key === key) ? (s.dir === "desc" ? "descending" : "ascending") : "none";
+    var name = t(label);
+    return '<th aria-sort="' + sort + '">' +
+      '<button type="button" class="th-sort" data-sort="' + key + '" title="' + esc(t("Sort by {name}", { name: name })) + '">' +
+      esc(name) + sortIndicator(key) + "</button>" +
       (filterable
         ? '<button type="button" class="th-filter' + (active ? " on" : "") + '" data-filter="' + key +
-        '" title="Filter" aria-label="Filter by ' + esc(label) + '">⋮</button>'
+        '" title="' + esc(t("Filter")) + '" aria-label="' + esc(t("Filter by {name}", { name: name })) + '">⋮</button>'
         : "") +
       "</th>";
   }
@@ -777,7 +956,7 @@
       menu.innerHTML = GUEST_STATES.map(function (p) {
         var checked = f.states.indexOf(p[0]) >= 0;
         return '<label class="checkline small"><input type="checkbox" data-state="' + p[0] + '"' +
-          (checked ? " checked" : "") + " /><span>" + esc(p[1]) +
+          (checked ? " checked" : "") + " /><span>" + esc(t(p[1])) +
           ' <span class="muted">(' + (counts[p[0]] || 0) + ")</span></span></label>";
       }).join("") +
         '<div class="row"><button class="btn small primary" id="thApply">Apply</button>' +
@@ -820,19 +999,23 @@
     var all = data.items || [];
     var items = applyGuestSort(applyGuestFilters(all));
     var counts = data.counts || {};
+    var f = guestFilterState();
+    state.guestsVisible = items;
 
-    el("guestsFilters").hidden = !showOwner;
+    // A selection only covers rows on screen, so a bulk action never touches
+    // somebody the current filter is hiding.
+    var visible = {};
+    items.forEach(function (g) { visible[g.id] = true; });
+    Object.keys(state.selected).forEach(function (id) { if (!visible[id]) { delete state.selected[id]; } });
+
+    var activeFilters = [];
+    if (f.who) { activeFilters.push(t("who contains \"{text}\"", { text: f.who })); }
+    if (f.states.length) { activeFilters.push(t("status: {states}", { states: f.states.map(stateLabel).join(", ") })); }
+    el("guestsUnowned").parentNode.hidden = !showOwner;
+    el("guestsFilters").hidden = !showOwner && !activeFilters.length;
+    el("guestsActiveFilters").textContent = activeFilters.length ? t("Filtered by {filters}", { filters: activeFilters.join("; ") }) : "";
     el("guestsEmpty").hidden = all.length > 0;
-    if (all.length && !items.length) {
-      el("guestTable").innerHTML = '<p class="muted small">Nothing matches that filter. ' +
-        '<button type="button" class="linkish" id="guestsClearFilters">Clear the filters</button></p>';
-      el("guestsClearFilters").onclick = function () {
-        state.guestFilter = { who: "", states: [] };
-        renderGuests(state.guests, state.guestsShowAll);
-      };
-      renderBulkBar();
-      return;
-    }
+    el("guestsExport").hidden = !all.length;
     el("guestsIntro").textContent = showOwner
       ? "Every external account in the tenant, with the colleague who is accountable for each one."
       : "Everybody here is recorded against your name, with a reason and an end date, so nothing stays open forever.";
@@ -849,51 +1032,85 @@
       : seenNote.note;
 
     // Only the states that need somebody to do something are called out. A row
-    // of six zeroes would be noise.
-    var interesting = [["blocked", "switched off"], ["expired", "ended"], ["expiring", "ending soon"], ["pending", "waiting to accept"]];
+    // of six zeroes would be noise. Each filters to its state; again clears.
+    var interesting = [["blocked", "{count} switched off"], ["expired", "{count} ended"],
+      ["expiring", "{count} ending soon"], ["pending", "{count} waiting to accept"]];
+    var only = f.states.length === 1 ? f.states[0] : "";
     var pills = interesting.filter(function (p) { return counts[p[0]]; })
-      .map(function (p) { return '<span class="pill ' + stateClass(p[0]) + '">' + esc(counts[p[0]]) + " " + esc(p[1]) + "</span>"; });
-    pills.unshift('<span class="small muted">' + esc(counts.total || 0) + (counts.total === 1 ? " person" : " people") + "</span>");
-    el("guestsCounts").innerHTML = items.length ? pills.join(" ") : "";
+      .map(function (p) {
+        return '<button type="button" class="pill pill-btn ' + stateClass(p[0]) + (only === p[0] ? " on" : "") +
+          '" data-pill="' + p[0] + '" aria-pressed="' + (only === p[0] ? "true" : "false") + '">' +
+          esc(t(p[1], { count: counts[p[0]] })) + "</button>";
+      });
+    pills.unshift('<span class="small muted">' +
+      esc(t(counts.total === 1 ? "{count} person" : "{count} people", { count: counts.total || 0 })) + "</span>");
+    el("guestsCounts").innerHTML = all.length ? pills.join(" ") : "";
+    el("guestsCounts").querySelectorAll("[data-pill]").forEach(function (b) {
+      b.onclick = function () {
+        var s = b.dataset.pill;
+        f.states = (f.states.length === 1 && f.states[0] === s) ? [] : [s];
+        renderGuests(state.guests, state.guestsShowAll);
+        var again = el("guestsCounts").querySelector('[data-pill="' + s + '"]');
+        if (again) { again.focus(); }
+      };
+    });
 
+    if (all.length && !items.length) {
+      el("guestTable").innerHTML = '<p class="muted small">' + esc(t("Nothing matches that filter.")) + " " +
+        '<button type="button" class="linkish" id="guestsClearFilters">' + esc(t("Clear the filters")) + "</button></p>";
+      el("guestsClearFilters").onclick = function () {
+        state.guestFilter = { who: "", states: [] };
+        state.guestSearch = "";
+        el("guestsSearch").value = "";
+        renderGuests(state.guests, state.guestsShowAll);
+      };
+      renderBulkBar();
+      return;
+    }
     if (!items.length) { el("guestTable").innerHTML = ""; renderBulkBar(); return; }
+
     var seen = signInData();
-    var head = "<tr>" + (showOwner ? '<th><input id="guestsSelAll" type="checkbox" title="Select everything shown" /></th>' : "") +
+    var selCount = items.filter(function (g) { return state.selected[g.id]; }).length;
+    var head = "<tr>" +
+      '<th class="sel"><input id="guestsSelAll" type="checkbox" title="' + esc(t("Select everything shown")) +
+      '" aria-label="' + esc(t("Select everything shown")) + '"' + (selCount === items.length ? " checked" : "") + " /></th>" +
       headerCell("who", "Who", true) + headerCell("status", "Status", true) +
       (seen.available ? headerCell("active", "Last active", false) : "") +
-      "<th>Why</th>" + (showOwner ? "<th>Owner</th>" : "") + "<th></th></tr>";
+      '<th class="th-plain">' + esc(t("Why")) + "</th>" +
+      (showOwner ? '<th class="th-plain">' + esc(t("Owner")) + "</th>" : "") + "<th></th></tr>";
     var rows = items.map(function (g, index) {
+      var name = g.displayName || g.email;
       var owner = "";
-      var select = "";
       if (showOwner) {
-        select = '<td><input type="checkbox" data-select="' + esc(g.id) + '"' +
-          (state.selected[g.id] ? " checked" : "") + " /></td>";
-        owner = '<td class="small">' + esc(g.owner && g.owner.displayName ? g.owner.displayName : "nobody") +
-          (g.orphaned ? ' <span class="pill warn">unowned</span>' : "") + "</td>";
+        owner = '<td class="small" data-label="' + esc(t("Owner")) + '"><span data-i18n-skip>' +
+          esc(g.orphaned ? t("nobody") : (g.owner && g.owner.displayName ? g.owner.displayName : t("nobody"))) + "</span>" +
+          (g.orphaned ? ' <span class="pill warn">' + esc(t("unowned")) + "</span>" : "") + "</td>";
       }
       // Two facts, one column: when they last used the access, and whether they
       // ever accepted the invitation in the first place. The second is only
       // worth a line when it is not the ordinary "yes, on such a date".
       var active = "";
       if (seen.available) {
-        active = '<td class="small">' +
-          (g.lastSignInLabel ? esc(g.lastSignInLabel) : '<span class="muted">Never</span>') +
+        active = '<td class="small" data-label="' + esc(t("Last active")) + '">' +
+          (g.lastSignInLabel ? esc(g.lastSignInLabel) : '<span class="muted">' + esc(t("Never")) + "</span>") +
           (g.redemption === "accepted" ? "" : '<br><span class="small muted">' + esc(g.redemptionLabel) + "</span>") +
           "</td>";
       }
-      // One way in, instead of four buttons per row. A row of Extend / End now /
-      // Hand over / Send again, half of them greyed, made every collaborator
-      // look like a form to fill in. What they are and what can be done about
-      // them belong on one surface, which is what Open gives.
-      return "<tr>" + select +
-        "<td><strong>" + esc(g.displayName) + "</strong><br>" +
+      // One way in, instead of four buttons per row. What they are and what can
+      // be done about them belong on one surface, which is what Open gives.
+      return "<tr>" +
+        '<td class="sel"><input type="checkbox" data-select="' + esc(g.id) + '" aria-label="' +
+        esc(t("Select {name}", { name: name })) + '"' + (state.selected[g.id] ? " checked" : "") + " /></td>" +
+        '<td data-label="' + esc(t("Who")) + '" data-i18n-skip><strong>' + esc(g.displayName) + "</strong><br>" +
         '<span class="small muted">' + esc(g.email) + "</span></td>" +
-        '<td><span class="pill ' + stateClass(g.state) + '">' + esc(g.state) + "</span><br>" +
+        '<td data-label="' + esc(t("Status")) + '"><span class="pill ' + stateClass(g.state) + '">' + esc(stateLabel(g.state)) + "</span><br>" +
         '<span class="small muted">' + esc(g.statusLabel) + "</span></td>" + active +
-        '<td class="small">' + esc(g.reason || "") + "</td>" + owner +
-        '<td><button class="btn small" data-guest-open="' + index + '">Open</button></td></tr>';
+        '<td class="small" data-label="' + esc(t("Why")) + '" data-i18n-skip>' + esc(g.reason || "") + "</td>" + owner +
+        '<td class="open-cell"><button class="btn small" data-guest-open="' + index + '" data-guest-id="' + esc(g.id) + '">' +
+        esc(t("Open")) + "</button></td></tr>";
     }).join("");
-    el("guestTable").innerHTML = "<table><thead>" + head + "</thead><tbody>" + rows + "</tbody></table>";
+    el("guestTable").innerHTML = '<table class="guest-table"><thead>' + head + "</thead><tbody>" + rows + "</tbody></table>";
+    el("guestsSelAll").indeterminate = selCount > 0 && selCount < items.length;
 
     el("guestTable").querySelectorAll("[data-guest-open]").forEach(function (b) {
       b.onclick = function () { openGuest(items[Number(b.dataset.guestOpen)]); };
@@ -913,40 +1130,153 @@
     el("guestTable").querySelectorAll("[data-filter]").forEach(function (b) {
       b.onclick = function (e) { e.stopPropagation(); openHeaderMenu(b.dataset.filter, b); };
     });
-
-    var f = guestFilterState();
-    var active = [];
-    if (f.who) { active.push('who contains "' + f.who + '"'); }
-    if (f.states.length) { active.push("status: " + f.states.join(", ")); }
-    if (el("guestsActiveFilters")) {
-      el("guestsActiveFilters").textContent = active.length ? "Filtered by " + active.join("; ") : "";
-    }
     el("guestTable").querySelectorAll("[data-select]").forEach(function (c) {
       c.onchange = function () {
         if (c.checked) { state.selected[c.dataset.select] = true; } else { delete state.selected[c.dataset.select]; }
+        var n = items.filter(function (g) { return state.selected[g.id]; }).length;
+        el("guestsSelAll").checked = n === items.length;
+        el("guestsSelAll").indeterminate = n > 0 && n < items.length;
         renderBulkBar();
       };
     });
-    if (el("guestsSelAll")) {
-      el("guestsSelAll").onchange = function () {
-        var on = el("guestsSelAll").checked;
-        items.forEach(function (g) { if (on) { state.selected[g.id] = true; } else { delete state.selected[g.id]; } });
-        renderGuests(state.guests, showOwner);
-      };
-    }
+    el("guestsSelAll").onchange = function () {
+      // Checked (also from the mixed state) selects every visible row,
+      // unchecked clears them.
+      var on = el("guestsSelAll").checked;
+      items.forEach(function (g) { if (on) { state.selected[g.id] = true; } else { delete state.selected[g.id]; } });
+      renderGuests(state.guests, state.guestsShowAll);
+      if (el("guestsSelAll")) { el("guestsSelAll").focus(); }
+    };
     renderBulkBar();
   }
 
-  /* --- bulk assignment (administrators) --- */
+  /* --- bulk actions on the selected rows --- */
 
   function selectedGuestIds() { return Object.keys(state.selected || {}); }
+
+  // What the API said this caller may do with this guest, from the list row.
+  function actionAvailable(g, key) {
+    var a = (g.actions || []).filter(function (x) { return x.key === key; })[0];
+    if (a) { return truthy(a.enabled); }
+    if (key === "cancel") { return ["blocked", "deleted"].indexOf(g.state) < 0; }
+    if (key === "renew") { return g.state !== "deleted"; }
+    return false;
+  }
+
+  function bulkEligible(key) {
+    var byId = {};
+    (state.guestsVisible || []).forEach(function (g) { byId[g.id] = g; });
+    return selectedGuestIds().map(function (id) { return byId[id]; })
+      .filter(function (g) { return g && actionAvailable(g, key); });
+  }
 
   function renderBulkBar() {
     var ids = selectedGuestIds();
     var bar = el("guestsBulk");
-    bar.hidden = !state.guestsShowAll || ids.length === 0;
+    bar.hidden = ids.length === 0;
+    // A confirmation drawn for an earlier selection would act on the wrong rows.
+    if (!state.bulkRunning) { el("guestsBulkConfirm").innerHTML = ""; }
     if (bar.hidden) { return; }
-    el("guestsSelected").textContent = ids.length + (ids.length === 1 ? " collaborator selected" : " collaborators selected");
+    el("guestsSelected").textContent = t(ids.length === 1 ? "{count} collaborator selected" : "{count} collaborators selected", { count: ids.length });
+    el("guestsAssignRow").hidden = !state.guestsShowAll;
+    el("guestsBulkRenew").disabled = state.bulkRunning || !bulkEligible("renew").length;
+    el("guestsBulkCancel").disabled = state.bulkRunning || !bulkEligible("cancel").length;
+  }
+
+  function openBulk(key) {
+    var list = bulkEligible(key);
+    if (!list.length) { return; }
+    var skipped = selectedGuestIds().length - list.length;
+    var policy = (state.me && state.me.policy) || {};
+    var renew = key === "renew";
+    var host = el("guestsBulkConfirm");
+    host.innerHTML = '<div class="bulk-confirm">' +
+      "<p><strong>" + esc(t(renew ? "Extend access for {count}" : "End access for {count}", { count: list.length })) + "</strong></p>" +
+      '<p class="small">' + esc(renew
+        ? t("A new end date is set from today, not added to the current one.")
+        : t("Sign-in is switched off straight away. The account is kept for the grace period, so you can undo this by extending them again.")) + "</p>" +
+      '<ul class="bulk-names" data-i18n-skip>' + list.map(function (g) {
+        return "<li>" + esc(g.displayName || g.email) + ' <span class="small muted">' + esc(g.email) + "</span></li>";
+      }).join("") + "</ul>" +
+      (skipped ? '<p class="small muted">' + esc(t(renew
+        ? "{count} of the selected cannot be extended and are left out."
+        : "{count} of the selected have already ended and are left out.", { count: skipped })) + "</p>" : "") +
+      (renew ? field("bulkDays", "For how many days from today",
+        '<input id="bulkDays" type="number" min="1" max="' + esc(policy.maxDays) + '" value="' + esc(policy.renewDays || policy.defaultDays) + '" />') : "") +
+      '<div class="row"><button type="button" class="btn small primary" id="bulkGo">' + esc(t(renew ? "Extend them" : "End their access")) + "</button>" +
+      '<button type="button" class="btn small ghost" id="bulkBack">' + esc(t("Cancel")) + "</button></div></div>";
+    el("bulkBack").onclick = function () { host.innerHTML = ""; setStatus("guestsBulkStatus", ""); };
+    el("bulkGo").onclick = function () {
+      var days = renew ? Number(el("bulkDays").value) : 0;
+      if (renew && (!(days >= 1) || (policy.maxDays && days > Number(policy.maxDays)))) {
+        setStatus("guestsBulkStatus", t("Choose between 1 and {max} days.", { max: policy.maxDays || 1 }), "bad");
+        return;
+      }
+      runBulk(key, list, days);
+    };
+    (el("bulkDays") || el("bulkGo")).focus();
+  }
+
+  // One request at a time: the API applies the safety limits per action, and a
+  // burst of parallel calls would only make some of them fail for no reason.
+  function runBulk(key, list, days) {
+    var ok = 0, failed = [], simulated = false, done = 0;
+    state.bulkRunning = true;
+    renderBulkBar();
+    el("guestsBulkConfirm").querySelectorAll("button, input").forEach(function (n) { n.disabled = true; });
+    setStatus("guestsBulkStatus", t("Working... {done} of {total}", { done: 0, total: list.length }));
+    return list.reduce(function (chain, g) {
+      return chain.then(function () {
+        var body = key === "renew" ? { action: "renew", days: days } : { action: "cancel" };
+        return api("/guests/" + encodeURIComponent(g.id) + "/action", "POST", body)
+          .then(function (data) { ok++; if (data && data.simulated) { simulated = true; } },
+            function (e) { failed.push({ name: g.displayName || g.email, error: e.message }); })
+          .then(function () {
+            done++;
+            setStatus("guestsBulkStatus", t("Working... {done} of {total}", { done: done, total: list.length }));
+          });
+      });
+    }, Promise.resolve()).then(function () {
+      state.bulkRunning = false;
+      state.selected = {};
+      setStatus("guestsBulkStatus", "");
+      toast(failed.length
+        ? t("{ok} done, {failed} failed.", { ok: ok, failed: failed.length })
+        : t("All {count} done.", { count: ok }), failed.length ? "bad" : "ok");
+      if (simulated) { toast(t("Simulation mode is on, so nothing was actually changed."), "ok"); }
+      failed.slice(0, 5).forEach(function (x) { toast(t("{name}: {error}", { name: x.name, error: x.error }), "bad"); });
+      if (failed.length > 5) { toast(t("And {count} more failed.", { count: failed.length - 5 }), "bad"); }
+      return loadGuests();
+    });
+  }
+
+  // Comma separated, quoted, with a leading apostrophe on anything a
+  // spreadsheet would run as a formula.
+  function csvCell(v) {
+    var s = String(v == null ? "" : v);
+    if (/^[=+\-@\t\r]/.test(s)) { s = "'" + s; }
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+
+  // The list as it is on screen: filtered and sorted.
+  function exportGuestsCsv() {
+    var items = state.guestsVisible || [];
+    var me = (state.me && state.me.user) || {};
+    var rows = [[t("Name"), t("Email"), t("Status"), t("End date"), t("Owner"), t("Reason"), t("Last active"), t("Invited")]];
+    items.forEach(function (g) {
+      var owner = g.owner ? (g.orphaned ? "" : g.owner.displayName) : (state.guestsShowAll ? "" : (me.displayName || me.email || ""));
+      rows.push([g.displayName, g.email, stateLabel(g.state), g.expiresOn, owner, g.reason, g.lastSignIn, g.invitedAt]);
+    });
+    // The byte order mark makes Excel read the file as UTF-8.
+    var text = "\ufeff" + rows.map(function (r) { return r.map(csvCell).join(","); }).join("\r\n");
+    var url = URL.createObjectURL(new Blob([text], { type: "text/csv;charset=utf-8" }));
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = "collaborators-" + new Date().toISOString().slice(0, 10) + ".csv";
+    document.body.appendChild(a);
+    a.click();
+    a.parentNode.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
   }
 
   // One people picker, used by bulk assignment and by the hand-over dialog.
@@ -984,9 +1314,9 @@
           if (mine !== seq) { return; }   // a later keystroke already replaced this
           host.innerHTML = (data.items || []).map(function (u) {
             return '<button type="button" class="match" data-oid="' + esc(u.id) + '">' +
-              "<span><strong>" + esc(u.displayName) + "</strong>" +
-              (u.isSelf ? ' <span class="pill">you</span>' : "") + "<br>" +
-              '<span class="small muted">' + esc(u.userPrincipalName || u.mail || "") + "</span></span></button>";
+              "<span><strong data-i18n-skip>" + esc(u.displayName) + "</strong>" +
+              (u.isSelf ? ' <span class="pill">' + esc(t("you")) + "</span>" : "") + "<br>" +
+              '<span class="small muted" data-i18n-skip>' + esc(u.userPrincipalName || u.mail || "") + "</span></span></button>";
           }).join("") ||
             // The API says WHY it is empty: a failed directory search and "no
             // such colleague" look identical otherwise.
@@ -1024,7 +1354,7 @@
       var ids = selectedGuestIds();
       if (!el("guestsOwnerId").value) { setStatus("guestsAssignStatus", "Pick the colleague from the list first.", "bad"); return; }
       el("guestsAssign").disabled = true;
-      setStatus("guestsAssignStatus", "Assigning " + ids.length + "...");
+      setStatus("guestsAssignStatus", t("Assigning {count}...", { count: ids.length }));
       api("/operations", "POST", { action: "assign", ownerId: el("guestsOwnerId").value, guestIds: ids })
         .then(function (data) {
           el("guestsAssign").disabled = false;
@@ -1043,6 +1373,19 @@
     };
 
     el("guestsUnowned").addEventListener("input", function () { renderGuests(state.guests, state.guestsShowAll); });
+
+    el("guestsBulkRenew").onclick = function () { openBulk("renew"); };
+    el("guestsBulkCancel").onclick = function () { openBulk("cancel"); };
+    el("guestsExport").onclick = exportGuestsCsv;
+
+    var searchDelay = null;
+    el("guestsSearch").addEventListener("input", function () {
+      if (searchDelay) { clearTimeout(searchDelay); }
+      searchDelay = setTimeout(function () {
+        state.guestSearch = el("guestsSearch").value;
+        if (state.guests) { renderGuests(state.guests, state.guestsShowAll); }
+      }, 200);
+    });
   }
 
   /* ---------------- acting on one collaborator ---------------- */
@@ -1113,12 +1456,22 @@
 
   /* --- the drawer: one collaborator, one surface --- */
 
-  function openGuest(guest) {
-    state.drawer = { guest: guest, key: null, loading: true };
-    el("gdName").textContent = guest.displayName || guest.email;
+  // guest is a list row, or just { id } for a deep link. action opens straight
+  // on that action once the full record is in (#guest/<id>/renew).
+  function openGuest(guest, action) {
+    var stub = !guest.state;
+    var opener = document.activeElement;
+    state.drawer = { guest: guest, key: null, loading: true, stub: stub, opener: opener };
+    el("gdName").textContent = guest.displayName || guest.email || "";
     el("gdEmail").textContent = guest.email || "";
     el("guestDrawer").hidden = false;
-    renderGuestOverview();
+    setHash("#guest/" + guest.id + (action ? "/" + action : ""));
+    if (stub) {
+      el("gdBody").innerHTML = '<p class="row small muted"><span class="spinner"></span> ' + esc(t("Loading...")) + "</p>";
+    } else {
+      renderGuestOverview();
+    }
+    el("guestDrawer").querySelector(".drawer-panel").focus();
 
     // The list already carries everything except what they can reach, so the
     // drawer opens on what we have and fills that section in when it arrives.
@@ -1127,26 +1480,50 @@
     api("/guests?id=" + encodeURIComponent(guest.id))
       .then(function (data) {
         if (!state.drawer || state.drawer.guest.id !== guest.id) { return; }   // closed, or moved on
-        state.drawer.guest = data.guest || guest;
+        var full = data.guest || guest;
+        state.drawer.guest = full;
         state.drawer.loading = false;
+        state.drawer.stub = false;
+        el("gdName").textContent = full.displayName || full.email || "";
+        el("gdEmail").textContent = full.email || "";
+        if (action && !state.drawer.key && (full.actions || []).some(function (a) { return a.key === action && truthy(a.enabled); })) {
+          renderGuestAction(action);
+          return;
+        }
         if (!state.drawer.key) { renderGuestOverview(); }
       })
       .catch(function (e) {
         if (!state.drawer || state.drawer.guest.id !== guest.id) { return; }
         state.drawer.loading = false;
         state.drawer.loadError = e.message;
+        if (state.drawer.stub) {
+          el("gdBody").innerHTML = errorHtml(e);
+          wireCopyButtons(el("gdBody"));
+          return;
+        }
         if (!state.drawer.key) { renderGuestOverview(); }
       });
   }
 
-  function closeGuest() {
+  // fromRoute: the hash already moved on (Back), so leave it alone.
+  function closeGuest(fromRoute) {
+    var d = state.drawer;
     el("guestDrawer").hidden = true;
     state.drawer = null;
+    if (fromRoute !== true && /^#guest\//.test(window.location.hash)) { setHash("#guests", true); }
+    if (!d) { return; }
+    // Focus goes back to the Open button that opened it, or to that row's
+    // button if the list has been redrawn since.
+    var back = (d.opener && d.opener !== document.body && document.contains(d.opener)) ? d.opener
+      : document.querySelector('[data-guest-id="' + cssEscape(d.guest.id) + '"]');
+    if (back && back.focus) { back.focus(); }
   }
 
-  function fact(label, value) {
+  // raw: the value is data (a name), not something to translate.
+  function fact(label, value, raw) {
     if (!value) { return ""; }
-    return '<div class="fact"><div class="k">' + esc(label) + '</div><div class="v">' + esc(value) + "</div></div>";
+    return '<div class="fact"><div class="k">' + esc(label) + '</div><div class="v"' + (raw ? " data-i18n-skip" : "") + ">" +
+      esc(value) + "</div></div>";
   }
 
   function renderGuestOverview() {
@@ -1154,25 +1531,26 @@
     if (!d) { return; }
     var g = d.guest;
     d.key = null;
+    setHash("#guest/" + g.id, true);
 
     var facts =
       fact(g.state === "pending" ? "Ends" : "Access until", g.expiresOnLabel) +
       fact("Days left", g.daysLeft > 0 ? String(g.daysLeft) : "") +
       fact("Accepted", g.redemptionLabel) +
-      (signInData().available ? fact("Last active", g.lastSignInLabel || "Never signed in") : "") +
-      fact("Owner", g.owner ? (g.owner.displayName || "nobody") : "") +
+      (signInData().available ? fact("Last active", g.lastSignInLabel || t("Never signed in")) : "") +
+      fact("Owner", g.owner ? (g.orphaned ? t("nobody") : (g.owner.displayName || t("nobody"))) : "", true) +
       fact("Invited", g.invitedAt ? relativeIso(g.invitedAt) : "") +
-      fact("Extended", g.renewCount ? g.renewCount + " time(s)" : "");
+      fact("Extended", g.renewCount ? t(Number(g.renewCount) === 1 ? "once" : "{count} times", { count: g.renewCount }) : "");
 
     // Actions first. They are why somebody opened this, and putting them under a
     // list that grows with every share meant scrolling past everything a guest
     // can reach to find the button that ends their access.
     var body =
-      '<p><span class="pill ' + stateClass(g.state) + '">' + esc(g.state) + "</span> " +
+      '<p><span class="pill ' + stateClass(g.state) + '">' + esc(stateLabel(g.state)) + "</span> " +
       '<span class="small muted">' + esc(g.statusLabel) + "</span></p>" +
       renderActionSection() +
-      (g.reason ? '<h3>Why they are here</h3><p>' + esc(g.reason) + "</p>" : "") +
-      "<h3>The details</h3>" + '<div class="facts">' + facts + "</div>" +
+      (g.reason ? "<h3>" + esc(t("Why they are here")) + '</h3><p data-i18n-skip>' + esc(g.reason) + "</p>" : "") +
+      "<h3>" + esc(t("The details")) + "</h3>" + '<div class="facts">' + facts + "</div>" +
       renderAccessSection();
 
     el("gdBody").innerHTML = body;
@@ -1182,13 +1560,16 @@
     el("gdBody").querySelectorAll("[data-unshare]").forEach(function (b) {
       b.onclick = function () { unshareItem(b.dataset.unshare, b.dataset.what); };
     });
-    if (el("gdShare")) {
-      el("gdShare").onclick = function () {
+    // Both start the share wizard with this person already chosen.
+    [["gdShare", "files"], ["gdTeam", "teams"]].forEach(function (pair) {
+      var b = el(pair[0]);
+      if (!b) { return; }
+      b.onclick = function () {
         var who = { id: g.id, email: g.email, displayName: g.displayName };
         closeGuest();
-        startShare("files", who);
+        startShare(pair[1], who);
       };
-    }
+    });
   }
 
   function unshareItem(itemId, what) {
@@ -1198,7 +1579,7 @@
     buttons.forEach(function (b) { b.disabled = true; });
     api("/guests/" + encodeURIComponent(guest.id) + "/action", "POST", { action: "unshare", itemId: itemId })
       .then(function (data) {
-        toast(data.message || (what + " is no longer shared."), "ok");
+        toast(data.message || t("{name} is no longer shared.", { name: what }), "ok");
         // Re-read rather than splice the row out locally: the API is the one
         // that knows whether the record went, and it also drops entries whose
         // access had already been removed elsewhere.
@@ -1240,9 +1621,12 @@
     // somebody whose access has ended: the grant would work and be unusable.
     var caps = (state.me && state.me.capabilities) || {};
     var live = ["active", "expiring", "pending"].indexOf(d.guest.state) >= 0;
-    var shareButton = (live && (truthy(caps.shareFiles) || truthy(caps.shareFolders)))
-      ? '<p style="margin-top:10px"><button class="btn small" id="gdShare">' +
-      (items && items.length ? "Share something else" : "Share something now") + "</button></p>"
+    var files = live && (truthy(caps.shareFiles) || truthy(caps.shareFolders)) && sharingAllowed().ok;
+    var teams = live && truthy(caps.shareTeams);
+    var shareButton = (files || teams)
+      ? '<p class="row" style="margin-top:10px">' +
+      (files ? '<button class="btn small" id="gdShare">' + esc(t(items && items.length ? "Share something else" : "Share something now")) + "</button>" : "") +
+      (teams ? '<button class="btn small" id="gdTeam">' + esc(t("Add to a Team")) + "</button>" : "") + "</p>"
       : "";
 
     if (!items || !items.length) {
@@ -1261,8 +1645,11 @@
       // Who shared it, always and first: with two colleagues sharing with the
       // same person, that is the fact that makes the rest of the line mean
       // anything.
-      var by = it.sharedByYou ? "You" : (it.sharedBy || "somebody else");
-      var meta = [by, it.kindLabel, it.roleLabel, it.sharedAtLabel ? "shared " + it.sharedAtLabel : ""]
+      // Each piece translated on its own; the joined line is skipped by the
+      // sweep because it carries a colleague's name.
+      var by = it.sharedByYou ? t("You") : (it.sharedBy || t("somebody else"));
+      var meta = [by, it.kindLabel ? t(it.kindLabel) : "", it.roleLabel ? t(it.roleLabel) : "",
+        it.sharedAtLabel ? t("shared {when}", { when: t(it.sharedAtLabel) }) : ""]
         .filter(function (m) { return m; }).join(" · ");
 
       var action = "";
@@ -1272,9 +1659,10 @@
         action = '<span class="small muted" title="' + esc(it.revokeBlockedReason) + '">-</span>';
       }
 
+      // A redacted name is a kind ("File"), so that one is translated.
       return '<div class="access-row"><span class="icon-cell">' + (ICONS[it.icon] || ICONS.file) + "</span>" +
-        '<span class="grow"><strong' + (it.redacted ? ' class="muted"' : "") + ">" + name + "</strong><br>" +
-        '<span class="small muted">' + esc(meta) + "</span></span>" + action + "</div>";
+        '<span class="grow"><strong' + (it.redacted ? ' class="muted"' : " data-i18n-skip") + ">" + name + "</strong><br>" +
+        '<span class="small muted" data-i18n-skip>' + esc(meta) + "</span></span>" + action + "</div>";
     }).join("");
 
     return "<h3>What they can reach</h3>" + '<div id="gdUnshareError" hidden></div>' +
@@ -1300,7 +1688,7 @@
         esc(a.label) + "</button>";
     }).join("");
     var reasons = blocked.map(function (a) {
-      return '<span class="small muted">' + esc(a.label) + ": " + esc(a.reason) + "</span>";
+      return '<span class="small muted">' + esc(t("{action}: {reason}", { action: t(a.label), reason: t(a.reason) })) + "</span>";
     }).join("");
 
     return "<h3>What you can do</h3>" +
@@ -1314,6 +1702,7 @@
     if (!spec) { return; }
     d.key = key;
     d.spec = spec;
+    setHash("#guest/" + d.guest.id + "/" + key, true);
 
     el("gdBody").innerHTML =
       "<h3>" + esc(spec.title) + "</h3>" +
@@ -1355,7 +1744,7 @@
         var name = g.displayName || d.guest.displayName;
         toast(data.simulated
           ? "Simulation mode is on, so nothing was actually changed."
-          : (data.message || d.spec.done.replace("{name}", name).replace("{until}", until)), "ok");
+          : (data.message || t(d.spec.done, { name: name, until: until ? t(until) : "" })), "ok");
         (data.warnings || []).forEach(function (w) { toast(w, "bad"); });
         closeGuest();
         return loadGuests();
@@ -1381,18 +1770,22 @@
     el("invSearch").focus();
   }
 
+  // Whose a guest is, said in a sentence that names nobody inside the sweep.
+  function ownerNote(g, untracked) {
+    if (g.mine) { return t("yours"); }
+    if (g.owner && g.owner.displayName) { return t("owned by {name}", { name: g.owner.displayName }); }
+    return g.tracked ? t("nobody looks after them") : t(untracked || "not tracked yet");
+  }
+
   function renderMatches(items) {
     var host = el("invMatches");
     if (!items || !items.length) { host.innerHTML = ""; return; }
-    host.innerHTML = '<p class="small muted matches-title">People we already work with:</p>' +
+    host.innerHTML = '<p class="small muted matches-title">' + esc(t("People we already work with:")) + "</p>" +
       items.map(function (g) {
-        var who = g.mine ? "yours"
-          : (g.owner && g.owner.displayName ? esc(g.owner.displayName) + "&rsquo;s"
-            : (g.tracked ? "nobody looks after them" : "not tracked yet"));
-        return '<button type="button" class="match" data-email="' + esc(g.email) + '">' +
+        return '<button type="button" class="match" data-email="' + esc(g.email) + '" data-i18n-skip>' +
           "<span><strong>" + esc(g.displayName) + "</strong><br>" +
           '<span class="small muted">' + esc(g.email) + "</span></span>" +
-          '<span class="small muted">' + who + "</span></button>";
+          '<span class="small muted">' + esc(ownerNote(g)) + "</span></button>";
       }).join("");
     host.querySelectorAll(".match").forEach(function (b) {
       b.onclick = function () {
@@ -1404,16 +1797,18 @@
   }
 
   var searchTimer = null;
+  var searchSeq = 0;
   function scheduleSearch() {
     var value = el("invSearch").value.trim();
+    var mine = ++searchSeq;
     el("invCheck").disabled = !looksLikeEmail(value);
     el("invVerdict").innerHTML = "";
     if (searchTimer) { clearTimeout(searchTimer); }
     if (value.length < 2) { el("invMatches").innerHTML = ""; return; }
     searchTimer = setTimeout(function () {
       api("/guests?search=" + encodeURIComponent(value))
-        .then(function (data) { renderMatches(data.items); })
-        .catch(function () { el("invMatches").innerHTML = ""; });
+        .then(function (data) { if (mine === searchSeq) { renderMatches(data.items); } })
+        .catch(function () { if (mine === searchSeq) { el("invMatches").innerHTML = ""; } });
     }, 350);
   }
 
@@ -1453,9 +1848,9 @@
         '<p class="small muted">They will get an email from us, not the default Microsoft one, and their access ends automatically unless you extend it.</p>',
         '<div class="row"><button id="invSend" class="btn primary">Send the invitation</button>' +
         '<button class="btn ghost" data-view-link="guests">Cancel</button>' +
-        '<span id="invSendStatus" class="status"></span></div>'
+        '<span id="invSendStatus" class="status" role="status"></span></div>'
       );
-    } else if (v.verdict === "notFound" && v.inviteBlockedReason) {
+    } else if ((v.verdict === "notFound" || v.verdict === "unowned") && v.inviteBlockedReason) {
       parts.push('<p class="status bad">' + esc(v.inviteBlockedReason) + "</p>");
     } else if (v.verdict === "unowned" && v.canClaim) {
       parts.push(
@@ -1465,16 +1860,16 @@
           esc(policy.maxDays) + '" value="' + esc(policy.defaultDays) + '" />'),
         '<div class="row"><button id="invClaim" class="btn primary" data-guest="' + esc(v.guest.id) +
         '">Take them on</button><button class="btn ghost" data-view-link="guests">Cancel</button>' +
-        '<span id="invClaimStatus" class="status"></span></div>'
+        '<span id="invClaimStatus" class="status" role="status"></span></div>'
       );
     } else if (v.verdict === "other") {
       if (v.canAsk) {
         parts.push(
           field("invAskMessage", "Send them a note (optional)",
             '<textarea id="invAskMessage" maxlength="600" rows="3" placeholder="Could you share the proposal folder with them?"></textarea>'),
-          '<div class="row"><button id="invAsk" class="btn primary" data-guest="' + esc(v.guest.id) + '">Ask ' +
-          esc(v.owner && v.owner.displayName ? v.owner.displayName : "the owner") + '</button>' +
-          '<button class="btn ghost" data-view-link="guests">Back</button><span id="invAskStatus" class="status"></span></div>'
+          '<div class="row"><button id="invAsk" class="btn primary" data-guest="' + esc(v.guest.id) + '" data-i18n-skip>' +
+          esc(v.owner && v.owner.displayName ? t("Ask {name}", { name: v.owner.displayName }) : t("Ask the owner")) + '</button>' +
+          '<button class="btn ghost" data-view-link="guests">Back</button><span id="invAskStatus" class="status" role="status"></span></div>'
         );
       } else {
         parts.push('<p><button class="btn" data-view-link="guests">Back</button></p>');
@@ -1508,7 +1903,10 @@
     host.className = "banner " + (level === "warn" ? "" : "done");
     el("homeResultTitle").textContent = title;
     el("homeResultBody").innerHTML = (lines || []).filter(function (l) { return l; })
-      .map(function (l) { return "<div>" + esc(l) + "</div>"; }).join("");
+      .map(function (l) {
+        // { text, raw: true } is data (a file name, an address), not a sentence.
+        return typeof l === "object" ? "<div data-i18n-skip>" + esc(l.text) + "</div>" : "<div>" + esc(l) + "</div>";
+      }).join("");
     host.hidden = false;
     showView("home");
     host.scrollIntoView({ block: "nearest" });
@@ -1521,13 +1919,13 @@
     var until = g.expiresOnLabel || g.expiresOn || "";
     var headline = data.simulated
       ? "Simulation mode is on, so nothing was actually done."
-      : doneMessage.replace("{name}", g.displayName || "They").replace("{until}", until);
+      : t(doneMessage, { name: g.displayName || g.email || "", until: until ? t(until) : "" });
     var lines = [];
     if (data.simulated) {
-      lines.push((g.displayName || "They") + " would have been set up until " + until + ".");
+      lines.push(t("{name} would have been set up until {until}.", { name: g.displayName || g.email || "", until: until ? t(until) : "" }));
     }
     else if (g.email) {
-      lines.push(g.email + (until ? ", until " + until : ""));
+      lines.push(until ? t("{email}, until {until}", { email: g.email, until: t(until) }) : { text: g.email, raw: true });
     }
     (data.warnings || []).forEach(function (w) { lines.push(w); });
 
@@ -1622,14 +2020,16 @@
   var SHARE_STEPS = ["What", "Who", "Confirm"];
 
   // recipient, when given, is a collaborator already chosen elsewhere (the
-  // drawer's Share button). The "who" step is then skipped entirely.
+  // drawer's Share or Add to a Team button). The "who" step is then skipped.
   function startShare(mode, recipient) {
     clearHomeResult();
     state.share = {
       mode: mode, step: 0, target: null, recipient: recipient || null, newGuest: null,
-      lockedRecipient: !!recipient, crumb: [], pane: mode === "teams" ? "teams" : "recent"
+      lockedRecipient: !!recipient, crumb: [], pane: mode === "teams" ? "teams" : "recent",
+      siteId: "", siteUrl: "", siteName: "", lastLoad: null
     };
     el("shPerson").value = "";
+    el("shSearch").value = "";
     el("shMatches").innerHTML = "";
     el("shNewGuest").innerHTML = "";
     el("shMessage").value = "";
@@ -1637,11 +2037,18 @@
     el("shItems").innerHTML = "";
     el("shError").hidden = true;
     el("shError").innerHTML = "";
-    state.share.siteId = ""; state.share.siteUrl = "";
+    el("shGo").disabled = false;
     setStatus("shWhoStatus", "");
     setStatus("shStatus", "");
     showView("share");
     renderShareStep();
+  }
+
+  // Back to the top of a pane: the site context goes with the crumb, or a
+  // blocked-site banner and a stale siteId would follow into Recent.
+  function leaveSite() {
+    var s = state.share;
+    s.crumb = []; s.siteId = ""; s.siteUrl = ""; s.siteName = "";
   }
 
   function renderShareStep() {
@@ -1659,13 +2066,21 @@
     el("shBack").hidden = s.step === 0;
 
     if (s.step === 0) {
-      el("shPickTitle").textContent = s.mode === "teams" ? "Choose a Team" : "Choose a " + shareLabel();
+      el("shPickTitle").textContent = s.mode === "teams" ? "Choose a Team"
+        : ({ "file": "Choose a file", "folder": "Choose a folder" }[shareLabel()] || "Choose a file or folder");
       el("shPickIntro").textContent = s.mode === "teams"
-        ? "Only Teams you own, and only those that accept guests."
-        : "You will only see what you can already open yourself." +
-        (shareLabel() === "folder" ? " Only folders can be shared here; open one to look inside." : "");
+        ? t("Only Teams you own, and only those that accept guests.")
+        : (shareLabel() === "folder"
+          ? t("You will only see what you can already open yourself. Only folders can be shared here; open one to look inside.")
+          : t("You will only see what you can already open yourself."));
       el("shSearchWrap").hidden = s.mode === "teams";
-      if (s.mode === "teams") { loadTeams(); } else { renderPanes(); loadPane(s.pane); }
+      if (s.mode === "teams") { loadTeams(); }
+      else {
+        renderPanes();
+        // Coming back from a later step re-runs whatever was on screen, so the
+        // list and the crumb above it agree.
+        if (s.lastLoad) { loadPane(s.lastLoad.pane, s.lastLoad.extra); } else { loadPane(s.pane); }
+      }
     } else if (s.step === 1) {
       el("shChosen").textContent = (s.target ? s.target.name : "");
       el("shPerson").focus();
@@ -1683,7 +2098,7 @@
     }).join(" ");
     el("shPanes").querySelectorAll("[data-pane]").forEach(function (b) {
       b.onclick = function () {
-        state.share.crumb = [];
+        leaveSite();
         state.share.pane = b.dataset.pane;
         el("shSearch").value = "";
         renderPanes();
@@ -1697,19 +2112,25 @@
     var host = el("shCrumb");
     if (!s.crumb.length) { host.innerHTML = ""; return; }
     host.innerHTML = s.crumb.map(function (c, i) {
-      return '<button type="button" class="linkish" data-crumb="' + i + '">' + esc(c.name) + "</button>";
+      return '<button type="button" class="linkish" data-crumb="' + i + '" data-i18n-skip>' + esc(c.name) + "</button>";
     }).join(" / ");
     host.querySelectorAll("[data-crumb]").forEach(function (b) {
       b.onclick = function () {
         var i = Number(b.dataset.crumb);
         var entry = state.share.crumb[i];
         state.share.crumb = state.share.crumb.slice(0, i);
+        if (i === 0) { state.share.siteId = ""; state.share.siteUrl = ""; state.share.siteName = ""; }
         openContainer(entry, true);
       };
     });
   }
 
+  // Only the latest request may draw: switching panes quickly would otherwise
+  // let a slow earlier answer replace the list that was asked for last.
+  var paneSeq = 0;
   function loadPane(pane, extra) {
+    var mine = ++paneSeq;
+    state.share.lastLoad = { pane: pane, extra: extra || null };
     var query = "?pane=" + encodeURIComponent(pane);
     Object.keys(extra || {}).forEach(function (k) {
       if (extra[k]) { query += "&" + k + "=" + encodeURIComponent(extra[k]); }
@@ -1719,15 +2140,18 @@
     el("shCrumb").innerHTML = "";
     el("shError").hidden = true;
     return api("/browse" + query).then(function (data) {
+      if (mine !== paneSeq) { return; }
       setStatus("shPickStatus", "");
       renderPickItems(data.items || [], data.emptyReason);
     }).catch(function (e) {
+      if (mine !== paneSeq) { return; }
       setStatus("shPickStatus", "");
       el("shItems").innerHTML = errorHtml(e) +
         '<p><button type="button" class="btn small ghost" id="shPickBackToSites">Back to the site list</button></p>';
       wireCopyButtons(el("shItems"));
       el("shPickBackToSites").onclick = function () {
-        state.share.crumb = [];
+        leaveSite();
+        state.share.pane = "sites";
         renderPanes();
         loadPane("sites");
       };
@@ -1752,11 +2176,11 @@
     var blocked = s.siteId && blockedSites()[s.siteId];
     if (blocked && !blockedAck()[s.siteId]) {
       host.innerHTML = '<div class="banner error"><div><div class="title">This site does not allow external sharing</div>' +
-        '<div class="small">' + esc(blocked) + " " + esc(t("Nothing here can be shared outside the company. The person who owns the site can change that in SharePoint.")) + "</div>" +
+        '<div class="small"><span>' + esc(blocked) + "</span> <span>" + esc(t("Nothing here can be shared outside the company. The person who owns the site can change that in SharePoint.")) + "</span></div>" +
         '<div class="row" style="margin-top:10px"><button type="button" class="btn small" id="shPickLeaveSite">Choose somewhere else</button>' +
         '<button type="button" class="btn small ghost" id="shPickAnyway">Look anyway</button></div></div></div>';
       el("shPickLeaveSite").onclick = function () {
-        s.crumb = []; s.siteId = ""; renderPanes(); loadPane("sites");
+        leaveSite(); s.pane = "sites"; renderPanes(); loadPane("sites");
       };
       // Looking is allowed; sharing is not. The block is acknowledged rather
       // than dropped, so the list below stays honest about what it can do.
@@ -1768,7 +2192,7 @@
     // the site. Every share control below is disabled while this is showing.
     var blockedBanner = blocked
       ? '<div class="banner warn"><div><div class="title">Sharing is blocked on this site</div>' +
-      '<div class="small">' + esc(blocked) + " " + esc(t("You can look around, but nothing here can be shared outside the company.")) + "</div>" +
+      '<div class="small"><span>' + esc(blocked) + "</span> <span>" + esc(t("You can look around, but nothing here can be shared outside the company.")) + "</span></div>" +
       '<div class="row" style="margin-top:10px"><button type="button" class="btn small" id="shPickLeaveSite">Choose somewhere else</button></div></div></div>'
       : "";
     if (!items.length) {
@@ -1789,15 +2213,16 @@
       // What it is, where it lives, and when it was last touched. A column of
       // twenty file names is not enough to pick from: half of them are called
       // "Proposal" and the icon is eight pixels of guesswork.
-      var facts = [it.category, it.path, it.whenLabel].filter(function (f) { return f; });
+      // Translated piece by piece: the joined line holds a path, which is data.
+      var facts = [it.category ? t(it.category) : "", it.path, it.whenLabel ? t(it.whenLabel) : ""].filter(function (f) { return f; });
       var main = '<button type="button" class="pick-main" data-open="' + i + '"' +
         (openable || it.canShare ? "" : " disabled") + ">" +
         '<span class="icon-cell">' + (ICONS[it.icon] || ICONS.file) + "</span>" +
-        "<span><strong>" + esc(it.name) + "</strong>" +
+        "<span><strong data-i18n-skip>" + esc(it.name) + "</strong>" +
         // Filled in when SharePoint answers for this site, which is after the
         // list is already usable.
         (it.kind === "site" ? '<span data-site-note="' + esc(it.webUrl) + '"></span>' : "") +
-        (facts.length ? '<br><span class="small muted">' + esc(facts.join(" · ")) + "</span>" : "") +
+        (facts.length ? '<br><span class="small muted" data-i18n-skip>' + esc(facts.join(" · ")) + "</span>" : "") +
         "</span></button>";
       // Opening the real thing in a new tab is how somebody checks they picked
       // the right file. It is a link, not a click on the row, so it never
@@ -1849,7 +2274,8 @@
     var b = el("shPickLeaveSite");
     if (!b) { return; }
     b.onclick = function () {
-      state.share.crumb = []; state.share.siteId = ""; state.share.siteUrl = "";
+      leaveSite();
+      state.share.pane = "sites";
       renderPanes();
       loadPane("sites");
     };
@@ -1969,10 +2395,12 @@
   }
 
   function loadTeams() {
+    var mine = ++paneSeq;
     setStatus("shPickStatus", "Loading your Teams...");
     el("shItems").innerHTML = "";
     el("shPanes").innerHTML = "";
     return api("/teams").then(function (data) {
+      if (mine !== paneSeq) { return; }
       setStatus("shPickStatus", data.tenantAllowsGuests ? "" : "This tenant does not allow guests in Teams.", data.tenantAllowsGuests ? "" : "bad");
       var items = data.items || [];
       if (!items.length) {
@@ -1982,19 +2410,19 @@
           esc(data.emptyReason || "You do not own any Teams.") + "</p>";
         return;
       }
-      el("shItems").innerHTML = items.map(function (t, i) {
-        return '<button type="button" class="match" data-team="' + i + '"' + (t.canShare ? "" : " disabled") + ">" +
-          '<span><span class="icon-cell">' + ICONS.team + "</span> <strong>" + esc(t.name) + "</strong>" +
-          (t.description ? '<br><span class="small muted">' + esc(t.description) + "</span>" : "") + "</span>" +
-          '<span class="small muted">' + esc(t.canShare ? "Add a guest" : t.shareBlockedReason) + "</span></button>";
+      el("shItems").innerHTML = items.map(function (team, i) {
+        return '<button type="button" class="match" data-team="' + i + '"' + (team.canShare ? "" : " disabled") + ">" +
+          '<span><span class="icon-cell">' + ICONS.team + '</span> <strong data-i18n-skip>' + esc(team.name) + "</strong>" +
+          (team.description ? '<br><span class="small muted" data-i18n-skip>' + esc(team.description) + "</span>" : "") + "</span>" +
+          '<span class="small muted">' + esc(team.canShare ? t("Add a guest") : t(team.shareBlockedReason || "")) + "</span></button>";
       }).join("");
       el("shItems").querySelectorAll("[data-team]").forEach(function (b) {
         b.onclick = function () {
-          var t = items[Number(b.dataset.team)];
-          chooseTarget({ kind: "team", teamId: t.id, name: t.name });
+          var team = items[Number(b.dataset.team)];
+          chooseTarget({ kind: "team", teamId: team.id, name: team.name });
         };
       });
-    }).catch(function (e) { setStatus("shPickStatus", e.message, "bad"); });
+    }).catch(function (e) { if (mine === paneSeq) { setStatus("shPickStatus", e.message, "bad"); } });
   }
 
   function chooseTarget(target) {
@@ -2005,36 +2433,41 @@
 
   /* --- step 2: who, search first --- */
 
+  // Every search and verdict carries the number of the keystroke it answers;
+  // only the latest may draw, or a slow answer for "jane@partner.co" could
+  // offer to invite that typo after the full address was already found.
   var sharePersonTimer = null;
+  var sharePersonSeq = 0;
   function sharePersonInput() {
     var term = el("shPerson").value.trim();
+    var mine = ++sharePersonSeq;
     el("shNewGuest").innerHTML = "";
     setStatus("shWhoStatus", "");
     if (sharePersonTimer) { clearTimeout(sharePersonTimer); }
     if (term.length < 2) { el("shMatches").innerHTML = ""; return; }
     sharePersonTimer = setTimeout(function () {
       api("/guests?search=" + encodeURIComponent(term)).then(function (data) {
+        if (mine !== sharePersonSeq) { return; }
         var items = data.items || [];
         var exact = items.filter(function (g) { return String(g.email).toLowerCase() === term.toLowerCase(); });
         renderSharePersonMatches(items);
         // Only after a search has actually run, and only when nothing here is
         // the person, is inviting somebody new offered at all.
-        if (looksLikeEmail(term) && !exact.length) { offerNewRecipient(term); }
-      }).catch(function (e) { setStatus("shWhoStatus", e.message, "bad"); });
+        if (looksLikeEmail(term) && !exact.length) { offerNewRecipient(term, mine); }
+      }).catch(function (e) { if (mine === sharePersonSeq) { setStatus("shWhoStatus", e.message, "bad"); } });
     }, 350);
   }
 
   function renderSharePersonMatches(items) {
     var host = el("shMatches");
-    if (!items.length) { host.innerHTML = '<p class="small muted">Nobody we already work with matches that.</p>'; return; }
-    host.innerHTML = '<p class="small muted matches-title">People we already work with:</p>' +
+    if (!items.length) { host.innerHTML = '<p class="small muted">' + esc(t("Nobody we already work with matches that.")) + "</p>"; return; }
+    host.innerHTML = '<p class="small muted matches-title">' + esc(t("People we already work with:")) + "</p>" +
       items.map(function (g) {
-        var who = g.mine ? "yours" : (g.owner && g.owner.displayName ? esc(g.owner.displayName) + "&rsquo;s" : "no owner");
         return '<button type="button" class="match" data-email="' + esc(g.email) + '" data-id="' + esc(g.id) + '"' +
-          (g.tracked ? "" : " disabled") + ">" +
+          (g.tracked ? "" : " disabled") + " data-i18n-skip>" +
           "<span><strong>" + esc(g.displayName) + "</strong><br>" +
           '<span class="small muted">' + esc(g.email) + "</span></span>" +
-          '<span class="small muted">' + (g.tracked ? who : "not set up here yet") + "</span></button>";
+          '<span class="small muted">' + esc(g.tracked ? ownerNote(g) : t("not set up here yet")) + "</span></button>";
       }).join("");
     host.querySelectorAll(".match").forEach(function (b) {
       b.onclick = function () {
@@ -2046,14 +2479,15 @@
     });
   }
 
-  function offerNewRecipient(email) {
-    setStatus("shWhoStatus", "Checking " + email + "...");
+  function offerNewRecipient(email, seq) {
+    setStatus("shWhoStatus", t("Checking {email}...", { email: email }));
     api("/guests?email=" + encodeURIComponent(email)).then(function (v) {
+      if (seq !== sharePersonSeq) { return; }
       setStatus("shWhoStatus", "");
       var host = el("shNewGuest");
       if (v.verdict === "notFound" && v.canInvite) {
         var policy = state.me.policy;
-        host.innerHTML = '<div class="card"><h3>Invite ' + esc(email) + "</h3>" +
+        host.innerHTML = '<div class="card"><h3 data-i18n-skip>' + esc(t("Invite {email}", { email: email })) + "</h3>" +
           '<p class="small muted">They will be set up as an external collaborator owned by you, with an end date, and given access to this in the same step.</p>' +
           field("shgName", "Their name", '<input id="shgName" type="text" maxlength="120" />') +
           field("shgReason", "Why do you need to work with them?" + (policy.requireReason ? "" : " (optional)"),
@@ -2080,13 +2514,14 @@
         state.share.newGuest = null;
         var go = document.createElement("button");
         go.className = "btn primary";
-        go.textContent = "Share with " + (v.guest.displayName || v.guest.email);
+        go.setAttribute("data-i18n-skip", "");
+        go.textContent = t("Share with {name}", { name: v.guest.displayName || v.guest.email });
         go.onclick = function () { state.share.step = 2; renderShareStep(); };
         host.appendChild(go);
       } else {
         host.innerHTML = '<p class="status bad">' + esc(v.inviteBlockedReason || v.message) + "</p>";
       }
-    }).catch(function (e) { setStatus("shWhoStatus", e.message, "bad"); });
+    }).catch(function (e) { if (seq === sharePersonSeq) { setStatus("shWhoStatus", e.message, "bad"); } });
   }
 
   /* --- step 3: confirm --- */
@@ -2100,14 +2535,16 @@
       el("shRole").value = "read";
       el("shRole").disabled = true;
     } else {
+      el("shRole").disabled = false;
       el("shRole").value = caps.defaultRole || "read";
     }
+    var kind = isTeam ? "Team" : ({ file: "File", folder: "Folder" }[s.target.kind] || s.target.kind);
     el("shSummary").innerHTML =
-      '<p><strong>' + esc(s.target.name) + "</strong>" +
-      '<br><span class="small muted">' + esc(isTeam ? "Team" : s.target.kind) + "</span></p>" +
-      "<p><strong>" + esc(s.recipient.displayName || s.recipient.email) + "</strong>" +
-      '<br><span class="small muted">' + esc(s.recipient.email) +
-      (s.newGuest ? " - will be invited now" : " - already works with us") + "</span></p>";
+      '<p><strong data-i18n-skip>' + esc(s.target.name) + "</strong>" +
+      '<br><span class="small muted">' + esc(t(kind)) + "</span></p>" +
+      '<p data-i18n-skip><strong>' + esc(s.recipient.displayName || s.recipient.email) + "</strong>" +
+      '<br><span class="small muted">' +
+      esc(t(s.newGuest ? "{email}, will be invited now" : "{email}, already works with us", { email: s.recipient.email })) + "</span></p>";
     el("shGo").textContent = isTeam ? "Add to the Team" : "Share";
   }
 
@@ -2121,12 +2558,12 @@
       message: el("shMessage").value.trim()
     };
     if (s.newGuest) { body.newGuest = s.newGuest; } else { body.guestId = s.recipient.id; }
-    if (s.siteId) { body.target = Object.assign({}, s.target, { siteId: s.siteId }); }
+    if (s.siteId && s.target.kind !== "team") { body.target = Object.assign({}, s.target, { siteId: s.siteId }); }
 
     el("shError").hidden = true;
     api("/share", "POST", body).then(function (data) {
       var lines = [];
-      if (s.target && s.target.name) { lines.push(s.target.name); }
+      if (s.target && s.target.name) { lines.push({ text: s.target.name, raw: true }); }
       (data.warnings || []).forEach(function (w) { lines.push(w); });
       return loadGuests()
         .then(function () { return sendPendingMail(data.outbox, lines); })
@@ -2143,14 +2580,15 @@
       // before anything is picked.
       if (e.data && e.data.sitePolicy) {
         var id = e.data.siteId || s.siteId;
-        if (id) { blockedSites()[id] = "SharePoint refused a share from here on " + new Date().toLocaleDateString() + "."; }
+        if (id) { blockedSites()[id] = t("SharePoint refused a share from here on {date}.", { date: new Date().toLocaleDateString() }); }
       }
       // The guest exists but the share did not happen. Offer the share alone,
       // so nobody is tempted to start again and invite the same person twice.
       if (e.data && e.data.guestCreated && e.data.guest && e.data.guest.id) {
         state.share.newGuest = null;
         state.share.recipient = { id: e.data.guest.id, email: e.data.guest.email, displayName: e.data.guest.displayName };
-        toast(e.data.guest.displayName + " was set up, but the share itself failed. Press Share to try just the share again.", "bad");
+        toast(t("{name} was set up, but the share itself failed. Press Share to try just the share again.",
+          { name: e.data.guest.displayName || e.data.guest.email }), "bad");
         renderShareSummary();
       }
     });
@@ -2166,34 +2604,94 @@
     };
     el("shGo").onclick = doShare;
     el("shPerson").addEventListener("input", sharePersonInput);
+    var pickSearchTimer = null;
     el("shSearch").addEventListener("input", function () {
       var term = el("shSearch").value.trim();
-      if (sharePersonTimer) { clearTimeout(sharePersonTimer); }
+      if (pickSearchTimer) { clearTimeout(pickSearchTimer); }
       if (term.length < 2) { return; }
-      sharePersonTimer = setTimeout(function () {
-        state.share.crumb = [];
+      pickSearchTimer = setTimeout(function () {
+        // Results span every site, so no site context carries over.
+        leaveSite();
+        renderPanes();
         loadPane("search", { q: term });
       }, 350);
     });
   }
 
-  /* ---------------- configuration ---------------- */
+  /* ---------------- configuration ----------------
+     state.config.settings is what the server last saved and is never edited in
+     place. Each admin tab lays its own form over a copy of it, so saving one
+     tab can never carry another tab's unsaved edits along. Email edits live in
+     state.emailDrafts until saved. */
+
+  // The form as it was last drawn from the server, per tab, to tell edits apart.
+  var baselines = { config: "", branding: "" };
+  var ADMIN_STATUS = { config: "cfgStatus", branding: "brStatus", emails: "emStatus" };
+
+  function enterAdminTab(name) {
+    // Fresh from the server, unless this tab holds edits a reload would wipe.
+    loadConfig(!isDirty(name)).then(function () {
+      if (state.view !== name) { return; }
+      if (name === "branding" && isDirty("branding")) { previewBrandColours(); }
+      if (name === "emails") { refreshPreview(); }
+    }).catch(function (e) { setStatus(ADMIN_STATUS[name], e.message, "bad"); });
+  }
 
   function loadConfig(force) {
     if (state.config && !force) { return Promise.resolve(state.config); }
     return api("/config").then(function (data) {
       state.config = data;
-      renderConfig();
+      renderAdminSections();
       return data;
-    }).catch(function (e) {
-      toast(e.message, "bad");
-      throw e;
+    });
+  }
+
+  // Redraws each tab from the saved settings, except a tab holding unsaved
+  // edits. saved names the tab that was just saved; it is always redrawn.
+  function renderAdminSections(saved) {
+    if (saved === "config" || !isDirty("config")) { renderConfig(); } else { renderConfigExtras(); }
+    if (saved === "branding" || !isDirty("branding")) { renderBranding(); }
+    if (saved === "emails" || !isDirty("emails")) { renderEmails(); }
+    updateDirty();
+  }
+
+  function isDirty(section) {
+    if (!state.config) { return false; }
+    if (section === "config") { return !!baselines.config && JSON.stringify(readConfigForm()) !== baselines.config; }
+    if (section === "branding") {
+      return state.pendingLogo !== undefined || (!!baselines.branding && JSON.stringify(readBrandingForm()) !== baselines.branding);
+    }
+    if (section === "emails") { return Object.keys(state.emailDrafts).length > 0; }
+    return false;
+  }
+
+  function anyDirty() { return isDirty("config") || isDirty("branding") || isDirty("emails"); }
+
+  // "Unsaved changes" next to each Save button, and a mark on the tab.
+  function updateDirty() {
+    [["config", "cfgDirty"], ["branding", "brDirty"], ["emails", "emDirty"]].forEach(function (p) {
+      var dirty = isDirty(p[0]);
+      el(p[1]).hidden = !dirty;
+      var tab = document.querySelector('.tab[data-view="' + p[0] + '"]');
+      if (tab) { tab.classList.toggle("dirty", dirty); }
     });
   }
 
   function listToText(list) { return (list || []).join(", "); }
   function textToList(text) {
     return String(text || "").split(/[,;\n]/).map(function (s) { return s.trim(); }).filter(Boolean);
+  }
+
+  // Copies form values over a copy of the saved settings, section by section.
+  function overlay(base, form) {
+    Object.keys(form).forEach(function (k) {
+      var v = form[k];
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        if (!base[k] || typeof base[k] !== "object") { base[k] = {}; }
+        Object.keys(v).forEach(function (kk) { base[k][kk] = v[kk]; });
+      } else { base[k] = v; }
+    });
+    return base;
   }
 
   function renderConfig() {
@@ -2251,15 +2749,6 @@
 
     el("cfgDryRun").value = truthy(s.dryRun) ? "true" : "false";
     el("cfgServicedesk").value = s.notifications.servicedeskEmail || "";
-
-    // The sending mailbox is deliberately not editable here, and saying so where
-    // somebody would otherwise go looking is the whole point of showing it.
-    var sender = state.config.sender || {};
-    el("cfgSender").value = sender.address || "(not configured)";
-    el("cfgSenderNote").innerHTML = esc(sender.note || "") +
-      (sender.docsUrl ? ' <a href="' + esc(safeUrl(sender.docsUrl)) + '" target="_blank" rel="noopener noreferrer">How to re-run the deployment</a>.' : "");
-
-    renderAdminAccess();
     el("cfgLogRetention").value = s.logRetentionDays;
 
     var lang = el("cfgLanguage");
@@ -2272,6 +2761,19 @@
     el("cfgNotifyRedeem").checked = truthy(s.notifications.notifyOwnerOnRedeem);
     el("cfgOrphanDigest").checked = truthy(s.notifications.orphanDigest);
 
+    renderConfigExtras();
+    baselines.config = JSON.stringify(readConfigForm());
+  }
+
+  // The read-only parts of the Configuration tab, safe to redraw under edits.
+  function renderConfigExtras() {
+    // The sending mailbox is deliberately not editable here, and saying so where
+    // somebody would otherwise go looking is the whole point of showing it.
+    var sender = state.config.sender || {};
+    el("cfgSender").value = sender.address || t("(not configured)");
+    el("cfgSenderNote").innerHTML = esc(sender.note || "") +
+      (sender.docsUrl ? ' <a href="' + esc(safeUrl(sender.docsUrl)) + '" target="_blank" rel="noopener noreferrer">How to re-run the deployment</a>.' : "");
+    renderAdminAccess();
     renderWarnings(state.config.warnings);
   }
 
@@ -2286,66 +2788,76 @@
     });
   }
 
-  // Collect the whole settings object from the form. The server sanitises
-  // everything again, so this only has to be a faithful read of what the admin
-  // typed, not a validator.
-  function collectSettings() {
-    var s = JSON.parse(JSON.stringify(state.config.settings));
-
-    s.expiry.defaultDays = Number(el("cfgDefaultDays").value);
-    s.expiry.maxDays = Number(el("cfgMaxDays").value);
-    s.expiry.renewDays = Number(el("cfgRenewDays").value);
-    s.expiry.graceDays = Number(el("cfgGraceDays").value);
-    s.expiry.reminderDays = textToList(el("cfgReminderDays").value).map(Number);
-    s.expiry.attribute = el("cfgAttribute").value;
-    s.expiry.allowSelfRenew = el("cfgAllowSelfRenew").checked;
-
-    s.invite.inviterGroupId = el("cfgInviterGroupId").value.trim();
-    s.invite.inviterGroupName = el("cfgInviterGroupName").value.trim();
-    s.invite.allowedDomains = textToList(el("cfgAllowedDomains").value);
-    s.invite.blockedDomains = textToList(el("cfgBlockedDomains").value);
-    s.invite.guestDirectoryVisibility = el("cfgVisibility").value;
-    s.invite.requireReason = el("cfgRequireReason").checked;
-    s.invite.setSponsor = el("cfgSetSponsor").checked;
-
-    s.sharing.files = el("cfgShareFiles").checked;
-    s.sharing.folders = el("cfgShareFolders").checked;
-    s.sharing.teams = el("cfgShareTeams").checked;
-    s.sharing.allowWrite = el("cfgAllowWrite").checked;
-
-    s.adoption.enabled = el("cfgAdoptionEnabled").checked;
-    s.adoption.initialDays = Number(el("cfgAdoptionDays").value);
-    s.adoption.useSponsors = el("cfgAdoptionSponsors").checked;
-    s.adoption.useAuditLog = el("cfgAdoptionAudit").checked;
-
-    s.inactivity.enabled = el("cfgInactivityEnabled").checked;
-    s.inactivity.thresholdDays = Number(el("cfgInactivityDays").value);
-    s.inactivity.action = el("cfgInactivityAction").value;
-    s.inactivity.notifyOnce = el("cfgInactivityOnce").checked;
-
-    s.safety.enabled = el("cfgSafetyEnabled").checked;
-    s.safety.dailyCapInvite = Number(el("cfgCapInvite").value);
-    s.safety.perUserDailyInvites = Number(el("cfgCapPerUser").value);
-    s.safety.dailyCapBlock = Number(el("cfgCapBlock").value);
-    s.safety.dailyCapDelete = Number(el("cfgCapDelete").value);
-    s.safety.percentCeiling = Number(el("cfgCeiling").value);
-
-    s.dryRun = el("cfgDryRun").value === "true";
-    s.notifications.servicedeskEmail = el("cfgServicedesk").value.trim();
-    s.logRetentionDays = Number(el("cfgLogRetention").value);
-    if (!s.portal) { s.portal = {}; }
-    s.portal.defaultLanguage = el("cfgLanguage").value;
-    s.notifications.notifyOwnerOnRedeem = el("cfgNotifyRedeem").checked;
-    s.notifications.orphanDigest = el("cfgOrphanDigest").checked;
-
-    return s;
+  // What the Configuration form says, and nothing else. The server sanitises
+  // everything again, so this only has to be a faithful read.
+  function readConfigForm() {
+    return {
+      expiry: {
+        defaultDays: Number(el("cfgDefaultDays").value),
+        maxDays: Number(el("cfgMaxDays").value),
+        renewDays: Number(el("cfgRenewDays").value),
+        graceDays: Number(el("cfgGraceDays").value),
+        reminderDays: textToList(el("cfgReminderDays").value).map(Number),
+        attribute: el("cfgAttribute").value,
+        allowSelfRenew: el("cfgAllowSelfRenew").checked
+      },
+      invite: {
+        inviterGroupId: el("cfgInviterGroupId").value.trim(),
+        inviterGroupName: el("cfgInviterGroupName").value.trim(),
+        allowedDomains: textToList(el("cfgAllowedDomains").value),
+        blockedDomains: textToList(el("cfgBlockedDomains").value),
+        guestDirectoryVisibility: el("cfgVisibility").value,
+        requireReason: el("cfgRequireReason").checked,
+        setSponsor: el("cfgSetSponsor").checked
+      },
+      sharing: {
+        files: el("cfgShareFiles").checked,
+        folders: el("cfgShareFolders").checked,
+        teams: el("cfgShareTeams").checked,
+        allowWrite: el("cfgAllowWrite").checked
+      },
+      adoption: {
+        enabled: el("cfgAdoptionEnabled").checked,
+        initialDays: Number(el("cfgAdoptionDays").value),
+        useSponsors: el("cfgAdoptionSponsors").checked,
+        useAuditLog: el("cfgAdoptionAudit").checked
+      },
+      inactivity: {
+        enabled: el("cfgInactivityEnabled").checked,
+        thresholdDays: Number(el("cfgInactivityDays").value),
+        action: el("cfgInactivityAction").value,
+        notifyOnce: el("cfgInactivityOnce").checked
+      },
+      safety: {
+        enabled: el("cfgSafetyEnabled").checked,
+        dailyCapInvite: Number(el("cfgCapInvite").value),
+        perUserDailyInvites: Number(el("cfgCapPerUser").value),
+        dailyCapBlock: Number(el("cfgCapBlock").value),
+        dailyCapDelete: Number(el("cfgCapDelete").value),
+        percentCeiling: Number(el("cfgCeiling").value)
+      },
+      dryRun: el("cfgDryRun").value === "true",
+      notifications: {
+        servicedeskEmail: el("cfgServicedesk").value.trim(),
+        notifyOwnerOnRedeem: el("cfgNotifyRedeem").checked,
+        orphanDigest: el("cfgOrphanDigest").checked
+      },
+      logRetentionDays: Number(el("cfgLogRetention").value),
+      portal: { defaultLanguage: el("cfgLanguage").value }
+    };
   }
 
-  function saveSettings(settings, statusId, okMessage) {
+  // The saved settings with this tab's form on top: branding and email
+  // wording go back exactly as they were saved.
+  function collectSettings() { return overlay(clone(state.config.settings), readConfigForm()); }
+
+  // onSaved runs once the server has accepted, before anything is redrawn.
+  function saveSettings(settings, statusId, okMessage, section, onSaved) {
     setStatus(statusId, "Saving...");
     return api("/config", "POST", { settings: settings }).then(function (data) {
       state.config = data;
-      renderConfig();
+      if (onSaved) { onSaved(); }
+      renderAdminSections(section);
       // A save that changed nothing is worth saying out loud: somebody who
       // believes they just flipped a switch needs to know it was already that
       // way, not be told "saved" and left wondering why nothing happened.
@@ -2381,13 +2893,15 @@
     el("wcAllowed").textContent = (state.config.allowedHosts || []).join(", ");
 
     var link = el("wcLink");
-    if (state.config.welcomeUrl && s.welcome.publishedUtc) {
-      link.href = state.config.welcomeUrl + "/welcome.html";
-      link.textContent = state.config.welcomeUrl + "/welcome.html";
+    var welcome = safeUrl(state.config.welcomeUrl);
+    if (welcome && s.welcome.publishedUtc) {
+      link.href = welcome + "/welcome.html";
+      link.textContent = welcome + "/welcome.html";
     } else {
       link.removeAttribute("href");
-      link.textContent = "not published yet";
+      link.textContent = t("not published yet");
     }
+    baselines.branding = JSON.stringify(readBrandingForm());
   }
 
   // Nothing on this tab takes effect until Save, the logo included. It used to
@@ -2435,85 +2949,110 @@
 
     var who = (a.assignments || []).map(function (x) {
       return '<div class="access-row"><span class="icon-cell">' + (x.type === "Group" ? "👥" : "👤") + "</span>" +
-        '<span class="grow"><strong>' + linked(x.displayName || x.id, x.portalUrl) + "</strong><br>" +
+        '<span class="grow" data-i18n-skip><strong>' + linked(x.displayName || x.id, x.portalUrl) + "</strong><br>" +
         '<span class="small muted">' + esc(x.type || "") + " · " + esc(x.id) + "</span></span></div>";
     }).join("");
 
     host.innerHTML =
       '<div class="facts" style="margin-bottom:14px">' +
-      '<div class="fact"><div class="k">Enterprise application</div><div class="v">' +
-      linked(app.displayName || "(unknown)", app.portalUrl) + "</div></div>" +
+      '<div class="fact"><div class="k">Enterprise application</div><div class="v" data-i18n-skip>' +
+      linked(app.displayName || t("(unknown)"), app.portalUrl) + "</div></div>" +
       '<div class="fact"><div class="k">Application (client) id</div><div class="v small">' + esc(app.appId || "") + "</div></div>" +
       "</div>" +
       "<h3 style=\"font-size:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em\">" +
-      esc(t("Holds {role}", { role: a.role || "the admin role" })) + "</h3>" +
+      esc(t("Holds {role}", { role: a.role || t("the admin role") })) + "</h3>" +
       (who ? '<div class="access-list">' + who + "</div>" : "") +
       (a.error ? '<p class="status bad small">' + esc(a.error) + "</p>" : "");
   }
 
-  function collectBranding() {
-    var s = collectSettings();
-    s.branding.companyName = el("brCompany").value.trim();
-    s.branding.portalTitle = el("brTitle").value.trim();
-    s.branding.portalSubtitle = el("brSubtitle").value.trim();
-    s.branding.primaryColor = el("brPrimary").value;
-    s.branding.accentColor = el("brAccent").value;
-    s.welcome.headline = el("wcHeadline").value.trim();
-    s.welcome.message = el("wcMessage").value.trim();
-    s.welcome.buttonLabel = el("wcButton").value.trim();
-    s.welcome.extraAllowedHosts = textToList(el("wcHosts").value);
-    s.welcome.autoRedirect = el("wcAuto").checked;
-    return s;
+  function readBrandingForm() {
+    return {
+      branding: {
+        companyName: el("brCompany").value.trim(),
+        portalTitle: el("brTitle").value.trim(),
+        portalSubtitle: el("brSubtitle").value.trim(),
+        primaryColor: el("brPrimary").value,
+        accentColor: el("brAccent").value
+      },
+      welcome: {
+        headline: el("wcHeadline").value.trim(),
+        message: el("wcMessage").value.trim(),
+        buttonLabel: el("wcButton").value.trim(),
+        extraAllowedHosts: textToList(el("wcHosts").value),
+        autoRedirect: el("wcAuto").checked
+      }
+    };
+  }
+
+  // The saved settings with only the Branding tab's form on top.
+  function collectBranding() { return overlay(clone(state.config.settings), readBrandingForm()); }
+
+  // Live preview of the picked colours on the portal itself, before saving.
+  function previewBrandColours() {
+    var root = document.documentElement.style;
+    var primary = el("brPrimary").value;
+    var accent = el("brAccent").value;
+    root.setProperty("--brand-primary", primary);
+    root.setProperty("--brand-on-primary", readableOn(primary));
+    root.setProperty("--brand-accent", accent);
+    root.setProperty("--brand-on-accent", readableOn(accent));
+    // The link colour is derived from BOTH pickers, so the preview has to
+    // recompute it whichever one moved.
+    root.setProperty("--brand-ink", brandInk(primary, accent));
+  }
+
+  // Leaving the tab without saving puts the saved colours back.
+  function revertBrandPreview() {
+    var root = document.documentElement.style;
+    ["--brand-primary", "--brand-on-primary", "--brand-accent", "--brand-on-accent", "--brand-ink"]
+      .forEach(function (p) { root.removeProperty(p); });
+    var saved = (state.me && state.me.branding) || lastBranding;
+    if (saved) { applyBranding(saved); }
   }
 
   function wireBrandingEditor() {
-    // Live preview of the colours while picking, so the admin sees the result
-    // before saving rather than after.
-    function syncColour(picker, text, cssVar) {
+    function syncColour(picker, text) {
       picker.addEventListener("input", function () {
         text.value = picker.value;
-        document.documentElement.style.setProperty(cssVar, picker.value);
-        document.documentElement.style.setProperty(cssVar === "--brand-primary" ? "--brand-on-primary" : "--brand-on-accent", readableOn(picker.value));
-        // The link colour is derived from BOTH pickers, so it has to be
-        // recomputed whichever one moved, or the preview lies about what the
-        // pair will look like together.
-        document.documentElement.style.setProperty("--brand-ink", brandInk(el("brPrimary").value, el("brAccent").value));
+        previewBrandColours();
       });
       text.addEventListener("change", function () {
         if (/^#[0-9a-fA-F]{6}$/.test(text.value.trim())) {
           picker.value = text.value.trim();
-          picker.dispatchEvent(new Event("input"));
+          picker.dispatchEvent(new Event("input", { bubbles: true }));
         } else {
           text.value = picker.value;
         }
       });
     }
-    syncColour(el("brPrimary"), el("brPrimaryText"), "--brand-primary");
-    syncColour(el("brAccent"), el("brAccentText"), "--brand-accent");
+    syncColour(el("brPrimary"), el("brPrimaryText"));
+    syncColour(el("brAccent"), el("brAccentText"));
 
     el("brSave").onclick = function () {
-      // The settings the admin has typed are captured BEFORE anything is sent,
-      // so a logo upload in the middle can never be the reason a company name
-      // goes back to what it was.
-      var wanted = collectBranding();
-      var logoChanged = state.pendingLogo !== undefined;
-      setStatus("brStatus", "Saving...");
-      saveLogoIfChanged()
-        .then(function (warning) {
-          state.pendingLogo = undefined;
-          el("brLogoFile").value = "";
-          return saveSettings(wanted, "brStatus", "Saved. The portal, your emails and the public page all use this now.")
-            .then(function () {
-              // A logo change is a change even when no text field moved, so the
-              // "nothing to save" line saveSettings writes would be a lie here.
-              if (logoChanged) {
-                setStatus("brStatus", "Saved. The portal, your emails and the public page all use this now.", "ok");
-              }
-              if (warning) { toast(warning, "bad"); }
-              renderBranding();
-            });
-        })
-        .catch(function (e) { setStatus("brStatus", e.message, "bad"); });
+      whileBusy(el("brSave"), function () {
+        // The settings the admin has typed are captured BEFORE anything is sent,
+        // so a logo upload in the middle can never be the reason a company name
+        // goes back to what it was.
+        var wanted = collectBranding();
+        var logoChanged = state.pendingLogo !== undefined;
+        setStatus("brStatus", "Saving...");
+        return saveLogoIfChanged()
+          .then(function (warning) {
+            state.pendingLogo = undefined;
+            el("brLogoFile").value = "";
+            return saveSettings(wanted, "brStatus", "Saved. The portal, your emails and the public page all use this now.", "branding")
+              .then(function () {
+                // A logo change is a change even when no text field moved, so the
+                // "nothing to save" line saveSettings writes would be a lie here.
+                if (logoChanged) {
+                  setStatus("brStatus", "Saved. The portal, your emails and the public page all use this now.", "ok");
+                }
+                if (warning) { toast(warning, "bad"); }
+                renderBranding();
+                updateDirty();
+              });
+          });
+      }).catch(function (e) { setStatus("brStatus", e.message, "bad"); });
     };
 
     // Returns a promise resolving to a warning string, or empty. The logo is
@@ -2537,6 +3076,7 @@
         state.pendingLogo = String(reader.result);
         setStatus("brStatus", "");
         renderLogoPreview();
+        updateDirty();
       };
       reader.readAsDataURL(file);
     };
@@ -2546,6 +3086,7 @@
       el("brLogoFile").value = "";
       setStatus("brStatus", "");
       renderLogoPreview();
+      updateDirty();
     };
   }
 
@@ -2555,16 +3096,34 @@
     return (state.config.emailCatalog || []).filter(function (c) { return c.key === state.emailKey; })[0];
   }
 
+  function savedTemplate(key) { return (state.config.settings.emails || {})[key] || {}; }
+
+  function sameTemplate(a, b) {
+    return truthy(a.enabled) === truthy(b.enabled) && String(a.subject || "") === String(b.subject || "") &&
+      String(a.html || "") === String(b.html || "") && truthy(a.useBrandShell) === truthy(b.useBrandShell);
+  }
+
+  // The saved settings with every unsaved template on top: what the preview,
+  // the test send and Save emails work from.
+  function emailSettings() {
+    var s = clone(state.config.settings);
+    if (!s.emails) { s.emails = {}; }
+    Object.keys(state.emailDrafts).forEach(function (k) { s.emails[k] = clone(state.emailDrafts[k]); });
+    return s;
+  }
+
+  var AUDIENCE_LABELS = { guest: "{label} (to the guest)", owner: "{label} (to the owner)", admin: "{label} (to the admin)" };
+
   function renderEmails() {
     var select = el("emKey");
     if (!select.options.length) {
       (state.config.emailCatalog || []).forEach(function (c) {
         var o = document.createElement("option");
         o.value = c.key;
-        o.textContent = c.label + " (to the " + c.audience + ")";
+        o.textContent = t(AUDIENCE_LABELS[c.audience] || "{label}", { label: t(c.label) });
         select.appendChild(o);
       });
-      state.emailKey = select.value = (state.config.emailCatalog[0] || {}).key || "";
+      state.emailKey = select.value = ((state.config.emailCatalog || [])[0] || {}).key || "";
     } else {
       select.value = state.emailKey;
     }
@@ -2574,26 +3133,28 @@
   function renderTemplate() {
     var entry = currentTemplateEntry();
     if (!entry) { return; }
-    var tpl = state.config.settings.emails[entry.key];
+    var tpl = state.emailDrafts[entry.key] || savedTemplate(entry.key);
     el("emDescription").textContent = entry.description;
     el("emEnabled").checked = truthy(tpl.enabled);
-    el("emSubject").value = tpl.subject;
-    el("emBody").value = tpl.html;
+    el("emSubject").value = tpl.subject || "";
+    el("emBody").value = tpl.html || "";
     el("emShell").checked = truthy(tpl.useBrandShell);
 
     var tokens = el("emTokens");
     tokens.innerHTML = "";
-    (entry.tokens || []).forEach(function (t) {
+    (entry.tokens || []).forEach(function (tok) {
       var b = document.createElement("button");
       b.type = "button";
       b.className = "token";
-      b.textContent = "{{" + t + "}}";
-      b.title = "Insert this into the body";
-      b.onclick = function () { insertToken("{{" + t + "}}"); };
+      b.setAttribute("data-i18n-skip", "");
+      b.textContent = "{{" + tok + "}}";
+      b.title = t("Insert this into the body");
+      b.onclick = function () { insertToken("{{" + tok + "}}"); };
       tokens.appendChild(b);
     });
 
-    refreshPreview();
+    // Only worth a round trip while somebody is looking at it.
+    if (state.view === "emails") { refreshPreview(); }
   }
 
   function insertToken(text) {
@@ -2603,23 +3164,28 @@
     box.value = box.value.slice(0, start) + text + box.value.slice(end);
     box.selectionStart = box.selectionEnd = start + text.length;
     box.focus();
+    captureTemplate();
+    updateDirty();
     schedulePreview();
   }
 
+  // Keeps the template on screen as a draft, or drops the draft when it is
+  // back to what is saved.
   function captureTemplate() {
     var entry = currentTemplateEntry();
-    if (!entry) { return null; }
-    var s = state.config.settings;
-    s.emails[entry.key] = {
+    if (!entry) { return; }
+    var draft = {
       enabled: el("emEnabled").checked,
       subject: el("emSubject").value,
       html: el("emBody").value,
       useBrandShell: el("emShell").checked
     };
-    return s;
+    if (sameTemplate(draft, savedTemplate(entry.key))) { delete state.emailDrafts[entry.key]; }
+    else { state.emailDrafts[entry.key] = draft; }
   }
 
   var previewTimer = null;
+  var previewSeq = 0;
   function schedulePreview() {
     if (previewTimer) { clearTimeout(previewTimer); }
     previewTimer = setTimeout(refreshPreview, 500);
@@ -2628,41 +3194,49 @@
   function refreshPreview() {
     var entry = currentTemplateEntry();
     if (!entry) { return; }
-    var settings = captureTemplate();
-    api("/config/testmail", "POST", { key: entry.key, settings: settings, preview: true })
+    captureTemplate();
+    var mine = ++previewSeq;
+    api("/config/testmail", "POST", { key: entry.key, settings: emailSettings(), preview: true })
       .then(function (data) {
+        if (mine !== previewSeq) { return; }
         el("emPreviewSubject").textContent = data.subject;
         el("emPreview").srcdoc = data.html;
         var unknown = el("emUnknown");
         if (data.unknownTokens && data.unknownTokens.length) {
           unknown.hidden = false;
-          unknown.textContent = "These placeholders are not available in this message and will come out empty: " +
-            data.unknownTokens.map(function (t) { return "{{" + t + "}}"; }).join(", ");
+          unknown.textContent = t("These placeholders are not available in this message and will come out empty: {tokens}",
+            { tokens: data.unknownTokens.map(function (tok) { return "{{" + tok + "}}"; }).join(", ") });
         } else {
           unknown.hidden = true;
         }
       })
-      .catch(function (e) { setStatus("emStatus", e.message, "bad"); });
+      .catch(function (e) { if (mine === previewSeq) { setStatus("emStatus", e.message, "bad"); } });
   }
 
   function wireEmailEditor() {
-    el("emKey").onchange = function () { state.emailKey = el("emKey").value; renderTemplate(); };
+    el("emKey").onchange = function () { captureTemplate(); state.emailKey = el("emKey").value; renderTemplate(); };
     ["emSubject", "emBody"].forEach(function (id) { el(id).addEventListener("input", schedulePreview); });
     ["emEnabled", "emShell"].forEach(function (id) { el(id).addEventListener("change", schedulePreview); });
 
     el("emSave").onclick = function () {
-      saveSettings(captureTemplate(), "emStatus", "Emails saved.").then(renderEmails).catch(function () { });
+      captureTemplate();
+      whileBusy(el("emSave"), function () {
+        return saveSettings(emailSettings(), "emStatus", "Emails saved.", "emails", function () { state.emailDrafts = {}; });
+      }).catch(function () { });
     };
 
     el("emTest").onclick = function () {
       var entry = currentTemplateEntry();
-      setStatus("emStatus", "Sending...");
-      api("/config/testmail", "POST", { key: entry.key, settings: captureTemplate(), preview: false })
-        .then(function (data) {
-          if (data.sent) { setStatus("emStatus", "Sent to " + data.sentTo + ".", "ok"); }
-          else { setStatus("emStatus", data.error || "Nothing was sent.", "bad"); }
-        })
-        .catch(function (e) { setStatus("emStatus", e.message, "bad"); });
+      if (!entry) { return; }
+      captureTemplate();
+      whileBusy(el("emTest"), function () {
+        setStatus("emStatus", "Sending...");
+        return api("/config/testmail", "POST", { key: entry.key, settings: emailSettings(), preview: false })
+          .then(function (data) {
+            if (data.sent) { setStatus("emStatus", t("Sent to {address}.", { address: data.sentTo }), "ok"); }
+            else { setStatus("emStatus", data.error || "Nothing was sent.", "bad"); }
+          });
+      }).catch(function (e) { setStatus("emStatus", e.message, "bad"); });
     };
 
     el("emReset").onclick = function () {
@@ -2670,36 +3244,108 @@
       if (!entry) { return; }
       // Resetting is a save with this template removed: the server fills the gap
       // from the shipped catalogue, so there is only one definition of "default".
-      var s = JSON.parse(JSON.stringify(state.config.settings));
-      delete s.emails[entry.key];
-      saveSettings(s, "emStatus", "Reset to the shipped wording.").then(renderEmails).catch(function () { });
+      // Other templates go back as saved; their drafts stay drafts.
+      var s = clone(state.config.settings);
+      if (s.emails) { delete s.emails[entry.key]; }
+      whileBusy(el("emReset"), function () {
+        return saveSettings(s, "emStatus", "Reset to the shipped wording.", "", function () { delete state.emailDrafts[entry.key]; })
+          .then(function () { renderTemplate(); updateDirty(); });
+      }).catch(function () { });
     };
+  }
+
+  // Edits in any admin tab update its "unsaved" mark; leaving the page with
+  // one pending asks first.
+  function wireDirtyTracking() {
+    ["view-config", "view-branding", "view-emails"].forEach(function (id) {
+      function onEdit() {
+        if (id === "view-emails") { captureTemplate(); }
+        updateDirty();
+      }
+      el(id).addEventListener("input", onEdit);
+      el(id).addEventListener("change", onEdit);
+    });
+    window.addEventListener("beforeunload", function (e) {
+      if (!anyDirty()) { return; }
+      e.preventDefault();
+      e.returnValue = "";
+    });
   }
 
   /* ---------------- activity ---------------- */
 
+  function clip(text) { return text.length > 300 ? text.slice(0, 300) + "..." : text; }
+
+  // A detail object as readable "key: value" lines; nested values stay compact
+  // JSON, which is rare and still better than one long line of braces.
+  function detailHtml(detail) {
+    if (detail == null || detail === "") { return ""; }
+    if (typeof detail !== "object") { return "<div>" + esc(clip(String(detail))) + "</div>"; }
+    return Object.keys(detail).map(function (k) {
+      var v = detail[k];
+      if (v == null || v === "") { return ""; }
+      var text = typeof v === "object" ? JSON.stringify(v) : String(v);
+      var label = k.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+      return '<div><span class="muted">' + esc(label) + ":</span> " + esc(clip(text)) + "</div>";
+    }).join("");
+  }
+
+  // Filters the rows already loaded; "Load more" fetches further pages.
+  function applyLogFilter() {
+    var term = String(el("logFilter").value || "").trim().toLowerCase();
+    var rows = el("logRows").children;
+    var shown = 0;
+    for (var i = 0; i < rows.length; i++) {
+      var hit = !term || rows[i].textContent.toLowerCase().indexOf(term) >= 0;
+      rows[i].hidden = !hit;
+      if (hit) { shown++; }
+    }
+    if (!rows.length) { return; }
+    setStatus("logStatus", term && !shown ? t("Nothing loaded so far matches that.") : "");
+  }
+
+  var logSeq = 0;
   function loadLog(reset) {
+    if (!state.me) { return Promise.resolve(); }
+    // One page at a time: a second click on Load more would append the same
+    // page twice. A reset supersedes whatever was still loading.
+    if (state.logLoading && !reset) { return Promise.resolve(); }
+    var mine = ++logSeq;
     if (reset) { el("logRows").innerHTML = ""; state.logNext = null; }
     var query = "?top=50";
     if (state.me.user.isAdmin && el("logAll") && el("logAll").checked) { query += "&scope=all"; }
     if (state.logNext) { query += "&npk=" + encodeURIComponent(state.logNext.npk) + "&nrk=" + encodeURIComponent(state.logNext.nrk || ""); }
+    state.logLoading = true;
+    el("logMore").disabled = true;
     setStatus("logStatus", "Loading...");
     return api("/logs" + query).then(function (data) {
+      if (mine !== logSeq) { return; }
       var rows = el("logRows");
       (data.items || []).forEach(function (item) {
         var tr = document.createElement("tr");
-        var detail = item.detail ? JSON.stringify(item.detail) : "";
-        if (detail === "{}") { detail = ""; }
+        var guest = item.guest || item.guestEmail
+          ? "<strong>" + esc(item.guest || item.guestEmail) + "</strong>" +
+          (item.guest && item.guestEmail ? '<br><span class="small muted">' + esc(item.guestEmail) + "</span>" : "")
+          : "";
         tr.innerHTML = "<td>" + esc(fmtDate(item.timestampUtc)) + "</td>" +
-          "<td>" + esc(item.event) + (item.simulated ? ' <span class="pill warn">simulated</span>' : "") + "</td>" +
-          "<td>" + esc(item.actor) + "</td>" +
-          '<td class="small muted">' + esc(detail.length > 300 ? detail.slice(0, 300) + "..." : detail) + "</td>";
+          "<td>" + esc(item.event) + (item.simulated ? ' <span class="pill warn">' + esc(t("simulated")) + "</span>" : "") +
+          (item.category ? '<br><span class="small muted">' + esc(item.category) + "</span>" : "") + "</td>" +
+          "<td data-i18n-skip>" + esc(item.actor) + "</td>" +
+          '<td class="small" data-i18n-skip>' + guest + "</td>" +
+          '<td class="small muted log-detail" data-i18n-skip>' + detailHtml(item.detail) + "</td>";
         rows.appendChild(tr);
       });
       state.logNext = data.next;
       el("logMore").hidden = !data.next;
       setStatus("logStatus", rows.children.length ? "" : "Nothing has happened yet.");
-    }).catch(function (e) { setStatus("logStatus", e.message, "bad"); });
+      applyLogFilter();
+    }).catch(function (e) {
+      if (mine === logSeq) { setStatus("logStatus", e.message, "bad"); }
+    }).then(function () {
+      if (mine !== logSeq) { return; }
+      state.logLoading = false;
+      el("logMore").disabled = false;
+    });
   }
 
   /* ---------------- diagnostics ---------------- */
@@ -2717,12 +3363,11 @@
     if (!d.codeStale) { return ""; }
     // Worth shouting about: when the code is stale, every other symptom on this
     // page is a red herring, and people lose hours to it.
-    return '<div class="banner error"><div><div class="title">The deployed code is out of date</div>' +
-      '<div class="small">This app is configured as version ' + esc(d.version) + " but the code running is " +
-      esc(d.codeVersion) + ". A zip deployment reports success as soon as the package uploads, so this happens " +
-      "when the package did not actually land. Re-run <strong>deploy/Update-Collaborate.ps1</strong> and check its output for functions that did not register. " +
-      "Until this matches, expect endpoints to 404 and settings changes not to take effect.</div>" +
-      '<div class="small">Functions the running code provides: ' + esc((d.functions || []).join(", ")) + "</div></div></div>";
+    // The sentence is dictionary markup; only the values are escaped into it.
+    return '<div class="banner error"><div><div class="title">' + esc(t("The deployed code is out of date")) + "</div>" +
+      '<div class="small">' + t("This app is configured as version {version} but the code running is {code}. A zip deployment reports success as soon as the package uploads, so this happens when the package did not actually land. Re-run <strong>deploy/Update-Collaborate.ps1</strong> and check its output for functions that did not register. Until this matches, expect endpoints to 404 and settings changes not to take effect.",
+        { version: esc(d.version), code: esc(d.codeVersion) }) + "</div>" +
+      '<div class="small" data-i18n-skip>' + esc(t("Functions the running code provides: {list}", { list: (d.functions || []).join(", ") })) + "</div></div></div>";
   }
 
   function renderHealthFindings(health, status) {
@@ -2743,7 +3388,7 @@
   }
 
   function runAdminOperation(action, label) {
-    setStatus("opStatus", label + "...");
+    setStatus("opStatus", label);
     document.querySelectorAll("#view-diag .btn").forEach(function (b) { b.disabled = true; });
     return api("/operations", "POST", { action: action })
       .then(function (data) {
@@ -2796,12 +3441,19 @@
         '<p class="small muted">' + esc(t("{n} external account(s) in the tenant.", { n: (d.guests ? d.guests.population : 0) })) +
         "</p></div>" +
         '<div class="card"><h3>' + esc(t("Version")) + "</h3>" +
-        ((d.update && d.update.available)
-          ? '<span class="pill warn">' + esc(t("{version} is available", { version: d.update.latest })) + "</span>"
-          : '<span class="pill ok">' + esc(t("up to date")) + "</span>") +
+        // "Running 0.7.0" is read off an app setting, not off the code. While
+        // the two disagree, saying "up to date" next to a banner that says the
+        // opposite is the worst of both.
+        (truthy(d.codeStale)
+          ? '<span class="pill bad">' + esc(t("the deployed code is older")) + "</span>"
+          : (d.update && d.update.available)
+            ? '<span class="pill warn">' + esc(t("{version} is available", { version: d.update.latest })) + "</span>"
+            : '<span class="pill ok">' + esc(t("up to date")) + "</span>") +
         '<p class="small muted">' +
-        esc(d.simulation ? t("Running {version} (simulation mode)", { version: d.version })
-          : t("Running {version}", { version: d.version })) +
+        esc(truthy(d.codeStale)
+          ? t("Configured as {version}, but the code running is {code}.", { version: d.version, code: d.codeVersion })
+          : d.simulation ? t("Running {version} (simulation mode)", { version: d.version })
+            : t("Running {version}", { version: d.version })) +
         (d.update && d.update.detail ? "<br>" + esc(d.update.detail) : "") + "</p></div>";
 
       var rows = el("diagRows");
@@ -2828,6 +3480,7 @@
       state.wizard = { settings: data.settings, step: 0, attributes: data.expiryAttributes };
       el("wizard").hidden = false;
       renderWizard();
+      el("wizard").querySelector(".card").focus();
     }).catch(function (e) { toast(e.message, "bad"); });
   }
 
@@ -2842,7 +3495,7 @@
     var body = el("wizBody");
     if (w.step === 0) {
       body.innerHTML =
-        "<h2>Make it yours</h2>" +
+        "<h2 id=\"wizHeading\">Make it yours</h2>" +
         "<p class=\"muted\">This is what your people and your guests will see. You can change all of it later.</p>" +
         field("wizCompany", "Company name", '<input id="wizCompany" type="text" maxlength="80" value="' + esc(s.branding.companyName) + '" />') +
         field("wizTitle", "Portal title", '<input id="wizTitle" type="text" maxlength="60" value="' + esc(s.branding.portalTitle) + '" />') +
@@ -2851,7 +3504,7 @@
         '<p class="small muted">The logo is uploaded on the Branding tab once setup is done.</p>';
     } else if (w.step === 1) {
       body.innerHTML =
-        "<h2>How long access lasts</h2>" +
+        "<h2 id=\"wizHeading\">How long access lasts</h2>" +
         "<p class=\"muted\">Every guest gets an end date. Before it arrives the owner is reminded; after it passes, sign-in is blocked and the account is only removed once the grace period is over.</p>" +
         field("wizDefault", "Default length in days", '<input id="wizDefault" type="number" min="1" max="3650" value="' + esc(s.expiry.defaultDays) + '" />') +
         field("wizMax", "Longest anybody may choose", '<input id="wizMax" type="number" min="1" max="3650" value="' + esc(s.expiry.maxDays) + '" />') +
@@ -2863,7 +3516,7 @@
         '<p class="small muted">The end date is written onto the guest account itself, so it outlives this tool. Pick an attribute nothing else uses: the check on the last step verifies that.</p>';
     } else if (w.step === 2) {
       body.innerHTML =
-        "<h2>Who may invite</h2>" +
+        "<h2 id=\"wizHeading\">Who may invite</h2>" +
         "<p class=\"muted\">Leave the group empty and any internal member can invite an external person. Everybody can always manage the guests they already own.</p>" +
         field("wizGroup", "Object id of the group allowed to invite (optional)", '<input id="wizGroup" type="text" value="' + esc(s.invite.inviterGroupId) + '" />') +
         field("wizGroupName", "Group name, shown to anybody who is refused", '<input id="wizGroupName" type="text" value="' + esc(s.invite.inviterGroupName) + '" />') +
@@ -2873,7 +3526,7 @@
         ' /><label for="wizReason">Require a reason for every invitation</label></div>';
     } else if (w.step === 3) {
       body.innerHTML =
-        "<h2>Sharing</h2>" +
+        "<h2 id=\"wizHeading\">Sharing</h2>" +
         "<p class=\"muted\">These run as the person using the portal, never as the service, so nobody can share something they do not already have access to. Switch off anything you do not want offered.</p>" +
         '<div class="checkline"><input id="wizFiles" type="checkbox"' + (s.sharing.files ? " checked" : "") + ' /><label for="wizFiles">Share files</label></div>' +
         '<div class="checkline"><input id="wizFolders" type="checkbox"' + (s.sharing.folders ? " checked" : "") + ' /><label for="wizFolders">Share folders</label></div>' +
@@ -2881,7 +3534,7 @@
         '<div class="checkline"><input id="wizWrite" type="checkbox"' + (s.sharing.allowWrite ? " checked" : "") + ' /><label for="wizWrite">Allow edit access, not only view</label></div>' +
         '<p class="small muted">Collaborate starts in simulation mode: it will log what it would do and change nothing until you turn that off in Configuration.</p>';
     } else {
-      body.innerHTML = "<h2>Check and finish</h2>" +
+      body.innerHTML = "<h2 id=\"wizHeading\">Check and finish</h2>" +
         '<p class="muted">Before finishing, Collaborate verifies that single sign-on is genuinely being enforced, that it can act on your behalf, and that the attribute you chose is free.</p>' +
         '<div id="wizChecks"><p class="row"><span class="spinner"></span> Running the checks...</p></div>';
       runWizardChecks();
@@ -2987,27 +3640,40 @@
   /* ---------------- boot ---------------- */
 
   function wire() {
-    document.querySelectorAll(".tab").forEach(function (t) {
-      t.onclick = function () { showView(t.dataset.view); };
+    document.querySelectorAll(".tab").forEach(function (b) {
+      b.onclick = function () { showView(b.dataset.view); };
     });
     wireViewLinks(document);
     el("signOutBtn").onclick = function () { msalInstance.logoutRedirect(); };
     el("cfgSave").onclick = function () {
-      saveSettings(collectSettings(), "cfgStatus", "Configuration saved.").catch(function () { });
+      whileBusy(el("cfgSave"), function () {
+        return saveSettings(collectSettings(), "cfgStatus", "Configuration saved.", "config");
+      }).catch(function () { });
     };
     el("logMore").onclick = function () { loadLog(false); };
     if (el("logAll")) { el("logAll").onchange = function () { loadLog(true); }; }
+    el("logFilter").addEventListener("input", applyLogFilter);
     el("diagRefresh").onclick = loadDiagnostics;
-    el("opRefresh").onclick = function () { runAdminOperation("refresh", "Reading Entra"); };
-    el("opAdopt").onclick = function () { runAdminOperation("adopt", "Looking for guests we do not track"); };
-    el("opOrphans").onclick = function () { runAdminOperation("orphanDigest", "Checking for unowned accounts"); };
-    el("opHealth").onclick = function () { runAdminOperation("healthCheck", "Running the checks"); };
-    el("opVersion").onclick = function () { runAdminOperation("versionCheck", "Checking"); };
+    el("opRefresh").onclick = function () { runAdminOperation("refresh", "Reading Entra..."); };
+    el("opAdopt").onclick = function () { runAdminOperation("adopt", "Looking for guests we do not track..."); };
+    el("opOrphans").onclick = function () { runAdminOperation("orphanDigest", "Checking for unowned accounts..."); };
+    el("opHealth").onclick = function () { runAdminOperation("healthCheck", "Running the checks..."); };
+    el("opVersion").onclick = function () { runAdminOperation("versionCheck", "Checking..."); };
+    // Data written into these by textContent must never pass the translator.
+    ["gdName", "gdEmail", "userName", "brandTitle", "gateTitle", "shChosen", "emPreviewSubject", "wcAllowed", "wcLink"]
+      .forEach(function (id) { if (el(id)) { el(id).setAttribute("data-i18n-skip", ""); } });
+    // Tab stays inside the open dialog.
+    document.addEventListener("keydown", function (e) {
+      if (!el("wizard").hidden) { trapTab(el("wizard").querySelector(".card"), e); }
+      else if (!el("guestDrawer").hidden) { trapTab(el("guestDrawer").querySelector(".drawer-panel"), e); }
+    });
+    window.addEventListener("hashchange", route);
     wireGuests();
     wireBulkAssign();
     wireShare();
     wireBrandingEditor();
     wireEmailEditor();
+    wireDirtyTracking();
     wireWizard();
   }
 
@@ -3021,7 +3687,7 @@
     el("gate").hidden = false;
     el("topbar").hidden = true;
     el("app").hidden = true;
-    el("signInBtn").onclick = function () { msalInstance.loginRedirect(loginRequest); };
+    el("signInBtn").onclick = signInRedirect;
   }
 
   applyLanguage();
@@ -3032,6 +3698,8 @@
     .then(function () { return msalInstance.handleRedirectPromise(); })
     .then(function (result) {
       if (result && result.account) { msalInstance.setActiveAccount(result.account); }
+      // Back from a sign-in redirect: put the deep link it started from back.
+      restoreHash();
       var acc = currentAccount();
       if (!acc) { showSignedOut(); return null; }
       msalInstance.setActiveAccount(acc);
@@ -3041,14 +3709,14 @@
     .catch(function (e) {
       var message = (e && e.message) ? e.message : String(e);
       if (/AADSTS/.test(message)) {
-        fail("Sign-in was refused: " + message);
+        fail(t("Sign-in was refused: {error}", { error: message }));
       } else if (currentAccount()) {
         // Signed in, but the API did not answer. loadMe has already explained
         // this on the page; a toast as well would only repeat it.
         console.error(e);
       } else {
         showSignedOut();
-        toast("Could not sign you in: " + message, "bad");
+        toast(t("Could not sign you in: {error}", { error: message }), "bad");
       }
     });
 })();

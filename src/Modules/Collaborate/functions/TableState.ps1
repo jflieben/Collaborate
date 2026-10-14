@@ -52,15 +52,11 @@ function Invoke-CBTable {
     if ($ExtraHeaders) { $ExtraHeaders.GetEnumerator() | ForEach-Object { $headers[$_.Key] = $_.Value } }
 
     $params = @{
-        Method                  = $Method
-        Uri                     = $uri
-        Headers                 = $headers
-        ErrorAction             = 'Stop'
-        StatusCodeVariable      = 'statusCode'
-        SkipHttpErrorCheck      = $true
-        ResponseHeadersVariable = 'respHeaders'
+        Method  = $Method
+        Uri     = $uri
+        Headers = $headers
     }
-    # Invoke-RestMethod supports custom verbs via -CustomMethod; MERGE needs it.
+    # MERGE is not a standard verb, so it goes through -CustomMethod.
     if ($Method -eq 'Merge') {
         $params.Remove('Method')
         $params.CustomMethod = 'MERGE'
@@ -70,14 +66,26 @@ function Invoke-CBTable {
         $params.Body = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 20 -Compress }
     }
 
-    $response = Invoke-RestMethod @params
+    # Storage answers ServerBusy (503) and the odd 500 under load; one blip must
+    # not abort a whole scan. Safe to repeat: every write here is idempotent.
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        $result = Invoke-CBJsonRequest -Request $params
+        if ($result.StatusCode -notin @(500, 503) -or $attempt -ge 4) { break }
+        Start-Sleep -Seconds ([Math]::Pow(2, $attempt))
+    }
+    $statusCode = $result.StatusCode
+    $response = $result.Body
+    $respHeaders = $result.Headers
 
     if ($Raw) {
         return [pscustomobject]@{ StatusCode = $statusCode; Body = $response; Headers = $respHeaders }
     }
     if ($statusCode -ge 400 -and $statusCode -ne 404) {
         $detail = if ($response) { ($response | ConvertTo-Json -Depth 8 -Compress) } else { '(no body)' }
-        throw "Table $Method $uri failed with HTTP $statusCode`: $detail"
+        Write-Warning "Table $Method $uri failed with HTTP $statusCode`: $detail"
+        throw "Table $Method $($Path -replace '\?.*$', '') failed with HTTP $statusCode`: $detail"
     }
     # Headers are always returned: Table pagination tokens arrive as headers.
     return [pscustomobject]@{ StatusCode = $statusCode; Body = $response; Headers = $respHeaders }
@@ -146,13 +154,17 @@ function Merge-CBTableEntity {
         Insert-Or-Merge an entity: listed properties are updated, existing
         properties NOT listed are preserved (unlike Set-CBTableEntity, which
         replaces the whole entity). MERGE without If-Match is the upsert form.
+    .PARAMETER UpdateOnly
+        Sends If-Match: * so a missing entity is NOT created. Returns $false
+        when the entity does not exist, $true otherwise.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Table,
         [Parameter(Mandatory)][string]$PartitionKey,
         [Parameter(Mandatory)][string]$RowKey,
-        [Parameter(Mandatory)][hashtable]$Properties
+        [Parameter(Mandatory)][hashtable]$Properties,
+        [switch]$UpdateOnly
     )
     $entity = @{ PartitionKey = $PartitionKey; RowKey = $RowKey }
     foreach ($kvp in $Properties.GetEnumerator()) {
@@ -161,6 +173,10 @@ function Merge-CBTableEntity {
     $pk = ConvertTo-CBODataKey $PartitionKey
     $rk = ConvertTo-CBODataKey $RowKey
     $path = "$Table(PartitionKey='$pk',RowKey='$rk')"
+    if ($UpdateOnly) {
+        $r = Invoke-CBTable -Method Merge -Path $path -Body $entity -ExtraHeaders @{ 'If-Match' = '*' }
+        return ($r.StatusCode -ne 404)
+    }
     $null = Invoke-CBTable -Method Merge -Path $path -Body $entity
 }
 
@@ -244,7 +260,8 @@ function Get-CBTableEntities {
     $all = [System.Collections.Generic.List[object]]::new()
     $parts = @()
     if ($Filter) { $parts += '$filter={0}' -f [Uri]::EscapeDataString($Filter) }
-    if ($Top -gt 0) { $parts += ('$top={0}' -f $Top) }
+    # The service refuses a page size above 1000; larger totals take more pages.
+    if ($Top -gt 0) { $parts += ('$top={0}' -f [Math]::Min($Top, 1000)) }
     $query = if ($parts) { '?' + ($parts -join '&') } else { '' }
     $path = "$Table()$query"
 
@@ -254,7 +271,7 @@ function Get-CBTableEntities {
         if ($result.Body -and ($result.Body.PSObject.Properties.Name -contains 'value')) {
             foreach ($item in $result.Body.value) { $all.Add($item) }
         }
-        if ($Top -gt 0 -and $all.Count -ge $Top) { break }
+        if ($Top -gt 0 -and $all.Count -ge $Top) { return @($all | Select-Object -First $Top) }
         # Continuation tokens arrive as response headers; re-query with them.
         $nextPk = $null; $nextRk = $null
         if ($result.Headers) {
@@ -326,9 +343,14 @@ function Invoke-CBTableBatchDelete {
             Accept         = 'application/json;odata=nometadata'
         }
         $uri = '{0}/$batch' -f $cfg.TableEndpoint
+        # A batch answers 202 even when its changeset failed; the real status is
+        # inside the multipart body.
         try {
-            $null = Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $body `
-                -ContentType "multipart/mixed; boundary=$batchId" -SkipHttpErrorCheck -StatusCodeVariable sc -ErrorAction Stop
+            $resp = Invoke-WebRequest -Method Post -Uri $uri -Headers $headers -Body $body `
+                -ContentType "multipart/mixed; boundary=$batchId" -SkipHttpErrorCheck -ErrorAction Stop
+            $sc = [int]$resp.StatusCode
+            $text = if ($resp.Content -is [byte[]]) { [Text.Encoding]::UTF8.GetString($resp.Content) } else { "$($resp.Content)" }
+            if ($text -match 'HTTP/1\.1 [45]\d\d') { $sc = 400 }
         }
         catch { $sc = 500 }
         if ($sc -ge 400) {

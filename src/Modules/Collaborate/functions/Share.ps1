@@ -171,6 +171,19 @@ function Test-CBTenantAllowsSharingWith {
     return @{ Allowed = $true; Reason = '' }
 }
 
+function Get-CBShareLogOwner {
+    <#
+    .SYNOPSIS
+        Which owner a share event is logged against. A document name is itself
+        information, so a colleague's share is not filed under the guest's owner,
+        who would otherwise read the name in their activity feed. The sharer still
+        sees it as the actor; administrators see everything.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)]$Caller, [string]$OwnerId)
+    if ($OwnerId -eq $Caller.Oid) { return $OwnerId }
+    return ''
+}
+
 function Grant-CBItemAccess {
     <#
     .SYNOPSIS
@@ -432,7 +445,7 @@ function Remove-CBSharedAccess {
 
     if ($Settings.dryRun) {
         Write-CBActivity -EventName "Would take back access to $name from $email" -Actor $Caller.Upn `
-            -OwnerId "$($Row.PartitionKey)" -GuestId $guestId -GuestUpn $email -GuestDisplayName "$($Row.DisplayName)" -Simulated
+            -OwnerId (Get-CBShareLogOwner -Caller $Caller -OwnerId "$($Row.PartitionKey)") -GuestId $guestId -GuestUpn $email -GuestDisplayName "$($Row.DisplayName)" -Simulated
         return @{ Ok = $true; Status = 200; Message = 'Simulation mode is on, so nothing was actually changed.' }
     }
 
@@ -479,7 +492,7 @@ function Remove-CBSharedAccess {
         }
         Remove-CBSharedItemRecord -Row $Row -ItemKey $ItemKey
         Write-CBActivity -EventName "Removed the record of $name for $email without SharePoint acting" -Actor $Caller.Upn `
-            -OwnerId "$($Row.PartitionKey)" -GuestId $guestId -GuestUpn $email -GuestDisplayName "$($Row.DisplayName)" `
+            -OwnerId (Get-CBShareLogOwner -Caller $Caller -OwnerId "$($Row.PartitionKey)") -GuestId $guestId -GuestUpn $email -GuestDisplayName "$($Row.DisplayName)" `
             -Detail @{ kind = $kind; name = $name; why = $detail }
         return @{ Ok = $true; Status = 200
             Message = "$name has been taken off the list. SharePoint would not confirm the change, which usually means the access was already gone or the site no longer allows external people at all. Check the site itself if you need to be certain."
@@ -488,7 +501,7 @@ function Remove-CBSharedAccess {
 
     Remove-CBSharedItemRecord -Row $Row -ItemKey $ItemKey
     Write-CBActivity -EventName "Took back $($entry.kind) access to $name from $email" -Actor $Caller.Upn `
-        -OwnerId "$($Row.PartitionKey)" -GuestId $guestId -GuestUpn $email -GuestDisplayName "$($Row.DisplayName)" `
+        -OwnerId (Get-CBShareLogOwner -Caller $Caller -OwnerId "$($Row.PartitionKey)") -GuestId $guestId -GuestUpn $email -GuestDisplayName "$($Row.DisplayName)" `
         -Detail @{ kind = $kind; name = $name }
     return @{ Ok = $true; Status = 200; Message = "$email can no longer reach $name." }
 }
@@ -738,7 +751,7 @@ function Invoke-CBShareRequest {
 
     if (-not $shareOk) {
         Write-CBActivity -EventName "Could not share $targetName with $($recipient.Email)" -Actor $Caller.Upn `
-            -OwnerId "$($recipient.Row.PartitionKey)" -GuestId "$($recipient.Row.RowKey)" -GuestUpn "$($recipient.Email)" `
+            -OwnerId (Get-CBShareLogOwner -Caller $Caller -OwnerId "$($recipient.Row.PartitionKey)") -GuestId "$($recipient.Row.RowKey)" -GuestUpn "$($recipient.Email)" `
             -GuestDisplayName "$($recipient.DisplayName)" -Detail @{ kind = $kind; error = $shareError }
 
         # A guest created a moment ago still exists. Say so plainly and hand back
@@ -787,7 +800,7 @@ function Invoke-CBShareRequest {
     }
 
     Write-CBActivity -EventName "Shared $targetName with $($recipient.Email)" -Actor $Caller.Upn `
-        -OwnerId "$($recipient.Row.PartitionKey)" -GuestId "$($recipient.Row.RowKey)" -GuestUpn "$($recipient.Email)" `
+        -OwnerId (Get-CBShareLogOwner -Caller $Caller -OwnerId "$($recipient.Row.PartitionKey)") -GuestId "$($recipient.Row.RowKey)" -GuestUpn "$($recipient.Email)" `
         -GuestDisplayName "$($recipient.DisplayName)" `
         -Detail @{ kind = $kind; name = $targetName; role = $role; url = $targetUrl; invited = [bool]$recipient.Created; mailed = $mailSent }
 

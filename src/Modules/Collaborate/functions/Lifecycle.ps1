@@ -133,7 +133,10 @@ function Get-CBLifecycleAction {
         # human decision is safer than an unexplained deletion.
         $grace = ConvertTo-CBDateOnly -Value "$($Row.GraceUntil)"
         if (-not $grace) { return $none }
-        if ($Now.Date -gt $grace) {
+        # With no grace configured the removal is due the same day, which is
+        # what the immediate queue message from a block relies on.
+        $noGrace = ([int]$Settings.expiry.graceDays -le 0)
+        if ($Now.Date -gt $grace -or ($noGrace -and $Now.Date -ge $grace)) {
             return @{ Action = 'delete'; Step = 0; DaysLeft = $daysLeft; GraceUntil = "$($Row.GraceUntil)"
                 Reason = "the grace period ended on $(Format-CBFriendlyDate -Value $Row.GraceUntil)"
             }
@@ -174,6 +177,11 @@ function Test-CBRenewAllowed {
     #>
     [CmdletBinding()] param([Parameter(Mandatory)]$Row, [Parameter(Mandatory)]$Caller, $Settings, [AllowNull()]$Days)
     if (-not $Settings) { $Settings = Get-CBSettings }
+    # Removed or switched off in Entra by somebody else (IT, an incident): an
+    # owner must not undo that with the managed identity's rights.
+    if (-not $Caller.IsAdmin -and "$($Row.EndedOutside)" -eq 'true' -and "$($Row.State)".ToLowerInvariant() -in @('blocked', 'deleted')) {
+        return @{ Allowed = $false; Reason = 'This account was switched off or removed outside Collaborate. Only an administrator can bring it back.'; Days = 0 }
+    }
     if (-not $Caller.IsAdmin -and -not $Settings.expiry.allowSelfRenew) {
         return @{ Allowed = $false; Reason = 'Extending access needs an administrator in this tenant.'; Days = 0 }
     }
@@ -282,6 +290,20 @@ function Set-CBGuestSignIn {
     }
 }
 
+function Test-CBAccountDisabled {
+    <#
+    .SYNOPSIS
+        True when sign-in is already off for this account, meaning somebody
+        other than Collaborate switched it off. Unknown counts as not disabled.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$GuestId)
+    try {
+        $r = Invoke-CBGraph -Raw -Uri ('/users/' + [Uri]::EscapeDataString($GuestId) + '?$select=accountEnabled')
+        return ($r.StatusCode -lt 400 -and $r.Body.accountEnabled -eq $false)
+    }
+    catch { return $false }
+}
+
 function Remove-CBGuestAccount {
     <#
     .SYNOPSIS
@@ -316,6 +338,32 @@ function Restore-CBDeletedGuest {
 }
 
 # --- Performing a lifecycle action -------------------------------------------
+
+function Get-CBHttpStatusFromError {
+    <#
+    .SYNOPSIS
+        The HTTP status in an error from Invoke-CBGraph, or 0 when there is none.
+    #>
+    [CmdletBinding()] param($ErrorRecord)
+    if ("$ErrorRecord" -match 'HTTP (\d{3})') { return [int]$Matches[1] }
+    return 0
+}
+
+function Save-CBGuestActionFailure {
+    <#
+    .SYNOPSIS
+        Records a lifecycle action Graph refused for good (a 4xx), so it is
+        visible on the guest and in the log instead of retrying into the poison
+        queue and using up the storm guard's daily count.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)]$Row, [Parameter(Mandatory)][string]$Action, [string]$ErrorText, [string]$Actor)
+    Save-CBGuestRecord -OwnerId "$($Row.PartitionKey)" -GuestId "$($Row.RowKey)" -Properties @{
+        LastActionError    = ConvertTo-CBBoundedString -Value "${Action}: $ErrorText" -MaxLength 400
+        LastActionErrorUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    }
+    Write-CBActivity -EventName "Could not $Action $($Row.Email)" -Actor $Actor -OwnerId "$($Row.PartitionKey)" -GuestId "$($Row.RowKey)" `
+        -GuestUpn "$($Row.Email)" -GuestDisplayName "$($Row.DisplayName)" -Detail @{ error = $ErrorText }
+}
 
 function Send-CBGuestActionMessage {
     <#
@@ -359,6 +407,8 @@ function Get-CBGuestMailValue {
     $values.graceDays = "$($Settings.expiry.graceDays)"
     $values.deleteOn = Format-CBFriendlyDate -Value "$($Row.GraceUntil)"
     $values.lastSignIn = Format-CBFriendlyDate -Value "$($Row.LastSignInUtc)"
+    # Straight to this guest's Extend action in the portal.
+    $values.guestUrl = '{0}/#guest/{1}/renew' -f "$($values.brand.portalUrl)".TrimEnd('/'), [Uri]::EscapeDataString("$($Row.RowKey)")
     return $values
 }
 
@@ -435,11 +485,22 @@ function Invoke-CBGuestBlock {
     $guard = Test-CBStormGuard -Action 'block' -Settings $Settings
     if (-not $guard.Allowed) { return @{ Done = $false; Reason = $guard.Reason; Retry = $true } }
 
-    Set-CBGuestSignIn -GuestId $guestId -Enabled $false
+    $wasOff = Test-CBAccountDisabled -GuestId $guestId
+    try { Set-CBGuestSignIn -GuestId $guestId -Enabled $false }
+    catch {
+        [void](Add-CBSafetyCount -Key 'block' -Delta -1)
+        $status = Get-CBHttpStatusFromError -ErrorRecord $_
+        if ($status -ge 400 -and $status -lt 500) {
+            Save-CBGuestActionFailure -Row $Row -Action 'end access for' -ErrorText $_.Exception.Message -Actor $Actor
+            return @{ Done = $false; Reason = "Graph refused: $($_.Exception.Message)"; Retry = $false }
+        }
+        throw
+    }
     Save-CBGuestRecord -OwnerId $ownerId -GuestId $guestId -Properties @{
         State        = 'blocked'
         BlockedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
         GraceUntil   = $graceUntil
+        EndedOutside = $(if ($wasOff) { 'true' } else { "$($Row.EndedOutside)" })
     }
 
     $updated = Set-CBRowValue -Row ($Row.PSObject.Copy()) -Name 'GraceUntil' -Value $graceUntil
@@ -483,7 +544,19 @@ function Invoke-CBGuestDelete {
     $guard = Test-CBStormGuard -Action 'delete' -Settings $Settings
     if (-not $guard.Allowed) { return @{ Done = $false; Reason = $guard.Reason; Retry = $true } }
 
-    Remove-CBGuestAccount -GuestId $guestId -Confirm:$false
+    try { Remove-CBGuestAccount -GuestId $guestId -Confirm:$false }
+    catch {
+        $status = Get-CBHttpStatusFromError -ErrorRecord $_
+        # 404: already gone, which is the outcome wanted. Anything else is refunded.
+        if ($status -ne 404) {
+            [void](Add-CBSafetyCount -Key 'delete' -Delta -1)
+            if ($status -ge 400 -and $status -lt 500) {
+                Save-CBGuestActionFailure -Row $Row -Action 'remove' -ErrorText $_.Exception.Message -Actor $Actor
+                return @{ Done = $false; Reason = "Graph refused: $($_.Exception.Message)"; Retry = $false }
+            }
+            throw
+        }
+    }
     Save-CBGuestRecord -OwnerId $ownerId -GuestId $guestId -Properties @{
         State        = 'deleted'
         DeletedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
@@ -522,7 +595,7 @@ function Invoke-CBQueuedGuestAction {
     $guestId = "$($Message.guestId)"
     if (-not $guestId) { return @{ Handled = $false; Retry = $false; Outcome = 'the message names no guest' } }
 
-    $row = Get-CBGuestRow -GuestId $guestId
+    $row = Get-CBGuestRow -GuestId $guestId -OwnerHint "$($Message.ownerId)"
     if (-not $row) { return @{ Handled = $false; Retry = $false; Outcome = 'we no longer track that guest' } }
 
     $decision = Get-CBLifecycleAction -Row $row -Settings $Settings
@@ -563,7 +636,7 @@ function Test-CBGuestAccess {
         @{ Ok; Status; Error; Row }
     #>
     [CmdletBinding()] param([Parameter(Mandatory)]$Caller, [Parameter(Mandatory)][string]$GuestId)
-    $row = Get-CBGuestRow -GuestId $GuestId
+    $row = Get-CBGuestRow -GuestId $GuestId -OwnerHint $Caller.Oid
     if (-not $row) { return @{ Ok = $false; Status = 404; Error = 'We do not track that person.' } }
     if ("$($row.PartitionKey)" -ne $Caller.Oid -and -not $Caller.IsAdmin) {
         # Deliberately the same answer as "does not exist": whether a colleague
@@ -640,6 +713,7 @@ function Update-CBGuestExpiry {
         GraceUntil     = ''
         BlockedAtUtc   = ''
         DeletedAtUtc   = ''
+        EndedOutside   = ''
         # A fresh window of reminders: the previous ones were about a date that
         # no longer applies.
         RemindersSent  = ''
@@ -653,7 +727,7 @@ function Update-CBGuestExpiry {
         -GuestId $GuestId -GuestUpn "$($row.Email)" -GuestDisplayName "$($row.DisplayName)" `
         -Detail @{ days = $allowed.Days; previous = "$($row.ExpiresOn)"; wasState = $state }
 
-    $fresh = Get-CBGuestRow -GuestId $GuestId
+    $fresh = Get-CBGuestRow -GuestId $GuestId -OwnerHint $ownerId
     return @{ Ok = $true; Status = 200; Simulated = $false; Warnings = @($warnings)
         Guest = $(if ($fresh) { Get-CBGuestView -Row $fresh -Settings $Settings } else { @{ id = $GuestId } })
     }
@@ -694,6 +768,7 @@ function Stop-CBGuestAccess {
     # itself; one person deliberately ending one collaboration is the opposite of
     # that, and refusing it would leave somebody unable to close off access they
     # know should be closed.
+    $wasOff = Test-CBAccountDisabled -GuestId $GuestId
     try { Set-CBGuestSignIn -GuestId $GuestId -Enabled $false }
     catch { return @{ Ok = $false; Status = 502; Error = "Sign-in could not be switched off: $($_.Exception.Message)" } }
 
@@ -702,6 +777,7 @@ function Stop-CBGuestAccess {
         BlockedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
         GraceUntil   = $graceUntil
         ExpiresOn    = (Get-CBExpiryDateString -Days 0)
+        EndedOutside = $(if ($wasOff) { 'true' } else { "$($row.EndedOutside)" })
     }
     Write-CBActivity -EventName "Ended access for $($row.Email) early" -Actor $Caller.Upn -OwnerId $ownerId `
         -GuestId $GuestId -GuestUpn "$($row.Email)" -GuestDisplayName "$($row.DisplayName)" `
@@ -713,7 +789,7 @@ function Stop-CBGuestAccess {
         catch { Write-Warning "Could not queue the immediate deletion for ${GuestId}: $($_.Exception.Message)" }
     }
 
-    $fresh = Get-CBGuestRow -GuestId $GuestId
+    $fresh = Get-CBGuestRow -GuestId $GuestId -OwnerHint $ownerId
     return @{ Ok = $true; Status = 200; Simulated = $false
         Guest = $(if ($fresh) { Get-CBGuestView -Row $fresh -Settings $Settings } else { @{ id = $GuestId } })
         Message = "Access ended. The account is kept until $(Format-CBFriendlyDate -Value $graceUntil) in case you need to undo this."
@@ -794,7 +870,7 @@ function Move-CBGuestOwner {
         -GuestId $GuestId -GuestUpn "$($row.Email)" -GuestDisplayName "$($row.DisplayName)" `
         -Detail @{ from = "$($row.OwnerUpn)"; to = "$newUpn"; reason = $why }
 
-    $fresh = Get-CBGuestRow -GuestId $GuestId
+    $fresh = Get-CBGuestRow -GuestId $GuestId -OwnerHint $NewOwnerId
     return @{ Ok = $true; Status = 200; Simulated = $false
         Guest = $(if ($fresh) { Get-CBGuestView -Row $fresh -Settings $Settings } else { @{ id = $GuestId } })
         Message = "$($newOwner.displayName) now looks after $($row.DisplayName)."
@@ -831,6 +907,10 @@ function Update-CBGuestInvitation {
         return @{ Ok = $true; Status = 200; Simulated = $true; Message = 'Simulation mode is on, so nothing was actually sent.' }
     }
 
+    # The personal limit first: a resend counts toward the tenant-wide invite cap,
+    # which pauses everything when reached, so one person must not reach it alone.
+    $quota = Test-CBUserInviteQuota -Oid $Caller.Oid -Settings $Settings
+    if (-not $quota.Allowed) { return @{ Ok = $false; Status = 429; Error = $quota.Reason } }
     $guard = Test-CBStormGuard -Action 'invite' -Settings $Settings
     if (-not $guard.Allowed) { return @{ Ok = $false; Status = 429; Error = $guard.Reason } }
 
@@ -841,6 +921,7 @@ function Update-CBGuestInvitation {
         inviteRedirectUrl       = $redirect
         sendInvitationMessage   = $false
     }
+    [void](Add-CBUserInviteCount -Oid $Caller.Oid)
 
     $values = Get-CBGuestMailValue -Row $row -Settings $Settings
     $values.redeemUrl = "$($invitation.inviteRedeemUrl)"

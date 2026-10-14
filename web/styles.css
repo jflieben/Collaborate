@@ -116,12 +116,15 @@ p { margin: 0 0 12px; }
 }
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--brand-ink); border-bottom-color: var(--brand-accent); font-weight: 600; }
+/* An admin tab holding unsaved edits. */
+.tab.dirty::after { content: " \2022"; color: var(--warn); }
+.dirty { font-size: 13px; color: var(--warn); font-weight: 600; }
 
 /* ---------- forms ---------- */
 .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 14px; }
 .field > span { font-weight: 600; font-size: 14px; }
 .field small { color: var(--muted); font-size: 13px; }
-input[type=text], input[type=email], input[type=number], input[type=url], select, textarea {
+input[type=text], input[type=email], input[type=number], input[type=url], input[type=search], select, textarea {
   font: inherit; color: var(--text); background: var(--surface);
   border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px; width: 100%;
 }
@@ -160,6 +163,11 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, .tab:focus-vi
 .pill.ok { background: #dff6dd; color: #0b5a0b; border-color: transparent; }
 .pill.warn { background: var(--warn-bg); color: var(--warn); border-color: transparent; }
 .pill.bad { background: #fde7e9; color: var(--danger); border-color: transparent; }
+/* Count pills that filter the list. */
+.pill-btn { font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+.pill-btn:hover { filter: brightness(.95); }
+.pill-btn.on { box-shadow: 0 0 0 2px var(--brand-accent); }
+.pill-btn:focus-visible { outline: 2px solid var(--brand-accent); outline-offset: 1px; }
 
 .status { font-size: 14px; color: var(--muted); }
 .status.ok { color: var(--ok); }
@@ -170,6 +178,12 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, .tab:focus-vi
 table { border-collapse: collapse; width: 100%; font-size: 14px; }
 th, td { text-align: left; padding: 8px 12px 8px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { font-size: 13px; color: var(--muted); font-weight: 600; }
+th.sel, td.sel { width: 1%; }
+.log-detail div { overflow-wrap: anywhere; }
+
+/* Bulk confirmation: who is about to be acted on. */
+.bulk-confirm { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.bulk-names { margin: 0 0 10px; padding-left: 20px; max-height: 180px; overflow-y: auto; font-size: 14px; }
 
 /* ---------- search-before-invite ---------- */
 /* Results are buttons, not links: picking one fills the box rather than
@@ -355,4 +369,30 @@ th .th-filter.on { color: var(--brand-ink); font-weight: 700; }
   white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0;
   background: var(--bg); border: 1px solid var(--line); border-radius: 4px;
   padding: 10px; font-size: 12px; max-height: 220px; overflow-y: auto;
+}
+
+/* ---------- phone width ---------- */
+@media (max-width: 640px) {
+  .topbar { flex-wrap: wrap; padding: 10px 16px; gap: 8px 12px; }
+  .brand { flex: 1 1 100%; }
+  .userbox { flex-wrap: wrap; white-space: normal; gap: 8px; }
+  .container { padding: 16px; }
+
+  /* The collaborator table as stacked cards, each cell labelled, instead of a
+     table that scrolls sideways. The header row keeps its sort and filter
+     buttons. */
+  .guest-table, .guest-table tbody, .guest-table tr, .guest-table td { display: block; width: 100%; }
+  .guest-table thead tr { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; padding-bottom: 8px; }
+  .guest-table thead th { border: none; padding: 0; width: auto; }
+  .guest-table thead th.th-plain, .guest-table thead th:empty { display: none; }
+  .guest-table tbody tr {
+    position: relative; border: 1px solid var(--line); border-radius: 6px;
+    padding: 10px 12px 10px 40px; margin-bottom: 10px;
+  }
+  .guest-table td { border: none; padding: 3px 0; }
+  .guest-table td[data-label]::before {
+    content: attr(data-label); display: block; font-size: 12px; color: var(--muted); font-weight: 600;
+  }
+  .guest-table td.sel { position: absolute; left: 12px; top: 12px; width: auto; padding: 0; }
+  .guest-table td.open-cell { padding-top: 8px; }
 }

@@ -30,9 +30,9 @@ Invoke-CBFunctionRun -Name 'RedemptionPoller' -Script {
     }
     Write-Host "$($pending.Count) invitation(s) are waiting to be accepted."
 
-    # Oldest first, so a backlog drains in the order people were invited rather
-    # than in whatever order the table happened to return.
-    $batch = @($pending | Sort-Object -Property { "$($_.InvitedAtUtc)" } | Select-Object -First $MAX_PER_RUN)
+    # Least recently checked first, so old invitations nobody ever accepts cannot
+    # crowd new ones out of the batch. Never-checked rows sort first.
+    $batch = @($pending | Sort-Object -Property { "$($_.LastPolledUtc)" }, { "$($_.InvitedAtUtc)" } | Select-Object -First $MAX_PER_RUN)
     $accepted = 0
     $gone = 0
     $unknown = 0

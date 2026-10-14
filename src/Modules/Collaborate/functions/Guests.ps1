@@ -469,8 +469,15 @@ function Get-CBGuestRow {
     .SYNOPSIS
         One guest by object id, without knowing who owns them. Cross-partition,
         which is why it is only used on single-guest paths and never in a loop.
+    .PARAMETER OwnerHint
+        The likely owner. Tried first as a point read, which avoids scanning the
+        table in the common case; the scan remains the fallback.
     #>
-    [CmdletBinding()] param([Parameter(Mandatory)][string]$GuestId)
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$GuestId, [string]$OwnerHint)
+    if ($OwnerHint) {
+        $hit = Get-CBTableEntity -Table (Get-CBTableNames).Guests -PartitionKey $OwnerHint -RowKey $GuestId
+        if ($hit) { return $hit }
+    }
     $rows = Get-CBAllGuestRow -Filter ("RowKey eq '{0}'" -f (ConvertTo-CBODataKey $GuestId))
     if (-not $rows -or $rows.Count -eq 0) { return $null }
     return $rows[0]
@@ -481,6 +488,10 @@ function Save-CBGuestRecord {
     .SYNOPSIS
         Writes (or merges into) a guest row. MERGE so that a caller updating one
         field cannot silently erase the rest of the record.
+    .DESCRIPTION
+        A merge only updates an existing row. The owner is the partition key, so
+        a caller holding a row from before a hand-over would otherwise recreate a
+        stub under the previous owner; instead the write follows the row.
     #>
     [CmdletBinding()]
     param(
@@ -494,8 +505,16 @@ function Save-CBGuestRecord {
     $props = @{} + $Properties
     $props.OwnerId = $(if ($pk -eq (Get-CBOrphanPartition)) { '' } else { $pk })
     $props.UpdatedUtc = [DateTimeOffset]::UtcNow.ToString('o')
-    if ($Replace) { Set-CBTableEntity -Table $tables.Guests -PartitionKey $pk -RowKey $GuestId -Properties $props }
-    else { Merge-CBTableEntity -Table $tables.Guests -PartitionKey $pk -RowKey $GuestId -Properties $props }
+    if ($Replace) { Set-CBTableEntity -Table $tables.Guests -PartitionKey $pk -RowKey $GuestId -Properties $props; return }
+    if (Merge-CBTableEntity -Table $tables.Guests -PartitionKey $pk -RowKey $GuestId -Properties $props -UpdateOnly) { return }
+
+    $current = Get-CBGuestRow -GuestId $GuestId
+    if (-not $current -or "$($current.PartitionKey)" -eq $pk) {
+        Write-Warning "Guest record $GuestId no longer exists; the update was not applied."
+        return
+    }
+    $props.Remove('OwnerId')
+    [void](Merge-CBTableEntity -Table $tables.Guests -PartitionKey "$($current.PartitionKey)" -RowKey $GuestId -Properties $props -UpdateOnly)
 }
 
 # --- Graph: the directory ----------------------------------------------------
@@ -514,6 +533,20 @@ function Get-CBDirectoryUser {
         return $r.Body
     }
     catch { return $null }
+}
+
+function Test-CBDirectoryUserGone {
+    <#
+    .SYNOPSIS
+        True only when Graph answers 404 for this id. Any other failure is not
+        evidence that the account is gone.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$UserId)
+    try {
+        $r = Invoke-CBGraph -Raw -Uri ('/users/' + [Uri]::EscapeDataString($UserId) + '?$select=id')
+        return ($r.StatusCode -eq 404)
+    }
+    catch { return $false }
 }
 
 function Find-CBDirectoryUserByEmail {
@@ -594,10 +627,11 @@ function Search-CBGuestDirectory {
     }
     if (-not $found -or $found.Count -eq 0) { return @() }
 
-    # Annotate with ownership from our own table. One scan, then an index: the
-    # alternative is a table lookup per hit on every keystroke.
+    # Annotate with ownership from our own table: one query for just these hits,
+    # rather than loading every row on every keystroke.
     $rows = @{}
-    foreach ($row in Get-CBAllGuestRow) { $rows["$($row.RowKey)"] = $row }
+    $idFilter = (@($found | ForEach-Object { "RowKey eq '{0}'" -f (ConvertTo-CBODataKey "$($_.id)") }) -join ' or ')
+    foreach ($row in Get-CBAllGuestRow -Filter $idFilter) { $rows["$($row.RowKey)"] = $row }
 
     $showOwner = ($Caller.IsAdmin -or "$($Settings.invite.guestDirectoryVisibility)" -eq 'all')
     $results = [System.Collections.Generic.List[object]]::new()
@@ -991,6 +1025,11 @@ function Register-CBExistingGuest {
     if (-not $Settings) { $Settings = Get-CBSettings }
     $warnings = [System.Collections.Generic.List[string]]::new()
 
+    # Claiming gives the same control over a guest as inviting them, so the same
+    # people may do it.
+    $canInvite = Test-CBCanInvite -Caller $Caller -Settings $Settings
+    if (-not $canInvite.Allowed) { return @{ Ok = $false; Status = 403; Error = $canInvite.Reason } }
+
     $user = Get-CBDirectoryUser -UserId $GuestId
     if (-not $user) { return @{ Ok = $false; Status = 404; Error = 'That account no longer exists.' } }
     if ("$($user.userType)" -ne 'Guest') { return @{ Ok = $false; Status = 400; Error = 'That is a colleague, not an external collaborator.' } }
@@ -998,7 +1037,9 @@ function Register-CBExistingGuest {
     $existing = Get-CBGuestRow -GuestId $GuestId
     if ($existing -and "$($existing.PartitionKey)" -ne (Get-CBOrphanPartition)) {
         if ("$($existing.PartitionKey)" -eq $Caller.Oid) { return @{ Ok = $false; Status = 409; Error = 'They are already on your list.' } }
-        return @{ Ok = $false; Status = 409; Error = "$($existing.OwnerDisplayName) already looks after them. Ask them to hand the account over." }
+        $named = ($Caller.IsAdmin -or "$($Settings.invite.guestDirectoryVisibility)" -eq 'all')
+        $who = if ($named) { "$($existing.OwnerDisplayName)" } else { 'A colleague' }
+        return @{ Ok = $false; Status = 409; Error = "$who already looks after them. Ask them to hand the account over." }
     }
 
     if ($Settings.invite.requireReason -and -not "$Reason".Trim()) {
@@ -1098,6 +1139,16 @@ function Send-CBOwnerEnquiry {
     if ($ownerId -eq $Caller.Oid) { return @{ Ok = $false; Status = 400; Error = 'They are already yours.' } }
     if (-not $row.OwnerUpn) { return @{ Ok = $false; Status = 400; Error = 'We do not have an address for the owner.' } }
 
+    # The same rule as the verdict: with visibility 'owned' the owner is not named.
+    $named = ($Caller.IsAdmin -or "$($Settings.invite.guestDirectoryVisibility)" -eq 'all')
+    $ownerLabel = if ($named) { "$($row.OwnerDisplayName)" } else { 'their owner' }
+
+    # A message to a colleague, so a modest daily limit keeps it from being spam.
+    $askLimit = 20
+    if ((Get-CBSafetyCount -Key "ask|$($Caller.Oid)") -ge $askLimit) {
+        return @{ Ok = $false; Status = 429; Error = "You have sent $askLimit of these today. Try again tomorrow." }
+    }
+
     $values = Get-CBMailTokenValue -Settings $Settings
     $values.guest = @{ displayName = "$($row.DisplayName)"; email = "$($row.Email)" }
     $values.owner = @{ displayName = "$($row.OwnerDisplayName)"; email = "$($row.OwnerUpn)" }
@@ -1108,16 +1159,18 @@ function Send-CBOwnerEnquiry {
     # benefits most from coming from them rather than from the service desk.
     $mail = Submit-CBGuestMail -Key 'askOwner' -To "$($row.OwnerUpn)" -Values $values -Settings $Settings `
         -Caller $Caller -OwnerId $ownerId -GuestId $GuestId
-    Write-CBActivity -EventName "Asked $($row.OwnerDisplayName) about $($row.Email)" -Actor $Caller.Upn -OwnerId $ownerId `
+    Write-CBActivity -EventName "Asked $ownerLabel about $($row.Email)" -Actor $Caller.Upn -OwnerId $ownerId `
         -GuestId $GuestId -GuestUpn "$($row.Email)" -GuestDisplayName "$($row.DisplayName)" `
         -Simulated:([bool]$Settings.dryRun) -Detail @{ message = $values.message; sent = $mail.Sent; handed = $mail.Handed }
 
     if (-not $mail.Sent -and -not $mail.Handed -and -not $Settings.dryRun) {
-        return @{ Ok = $false; Status = 502; Error = "The message could not be sent. Contact $($row.OwnerUpn) directly." }
+        $contact = if ($named) { "Contact $($row.OwnerUpn) directly." } else { 'Try again later.' }
+        return @{ Ok = $false; Status = 502; Error = "The message could not be sent. $contact" }
     }
+    if (-not $Settings.dryRun) { [void](Add-CBSafetyCount -Key "ask|$($Caller.Oid)") }
     return @{ Ok = $true; Status = 200; Sent = $mail.Sent; Simulated = [bool]$Settings.dryRun
         Outbox = @($(if ($mail.Handed) { $mail.Message }))
-        Message = $(if ($Settings.dryRun) { 'Simulation mode is on, so nothing was actually sent.' } else { "Sent to $($row.OwnerDisplayName)." })
+        Message = $(if ($Settings.dryRun) { 'Simulation mode is on, so nothing was actually sent.' } else { "Sent to $ownerLabel." })
     }
 }
 
@@ -1146,8 +1199,9 @@ function Complete-CBGuestRedemption {
 
     $user = Get-CBDirectoryUser -UserId $guestId
     if (-not $user) {
+        if (-not (Test-CBDirectoryUserGone -UserId $guestId)) { return @{ Changed = $false; Reason = 'lookup failed' } }
         # Invited, then removed elsewhere. Record it and stop polling for them.
-        Save-CBGuestRecord -OwnerId $ownerId -GuestId $guestId -Properties @{ State = 'deleted'; DeletedAtUtc = [DateTimeOffset]::UtcNow.ToString('o') }
+        Save-CBGuestRecord -OwnerId $ownerId -GuestId $guestId -Properties @{ State = 'deleted'; DeletedAtUtc = [DateTimeOffset]::UtcNow.ToString('o'); EndedOutside = 'true' }
         Write-CBActivity -EventName "$($Row.Email) no longer exists in Entra" -OwnerId $ownerId -GuestId $guestId `
             -GuestUpn "$($Row.Email)" -GuestDisplayName "$($Row.DisplayName)" -Detail 'The account was removed outside Collaborate, so it is marked as gone here too.'
         return @{ Changed = $true; Reason = 'deleted elsewhere' }
@@ -1156,7 +1210,10 @@ function Complete-CBGuestRedemption {
         -StateChangedAt "$($user.externalUserStateChangeDateTime)" `
         -LastSignIn "$($Row.LastSignInUtc)" -Created "$($user.createdDateTime)"
 
-    if ($redemption.State -eq 'pending') { return @{ Changed = $false; Reason = 'still pending' } }
+    if ($redemption.State -eq 'pending') {
+        Save-CBGuestRecord -OwnerId $ownerId -GuestId $guestId -Properties @{ LastPolledUtc = [DateTimeOffset]::UtcNow.ToString('o') }
+        return @{ Changed = $false; Reason = 'still pending' }
+    }
 
     if ($redemption.State -eq 'unknown') {
         # Entra has stopped saying anything about this invitation. Polling for an
@@ -1192,6 +1249,7 @@ function Complete-CBGuestRedemption {
     $values.guest = @{ displayName = "$($user.displayName)"; email = "$($Row.Email)" }
     $values.owner = @{ displayName = "$($Row.OwnerDisplayName)"; email = "$($Row.OwnerUpn)" }
     $values.expiresOn = Format-CBFriendlyDate -Value "$($Row.ExpiresOn)"
+    $values.guestUrl = '{0}/#guest/{1}' -f "$($values.brand.portalUrl)".TrimEnd('/'), [Uri]::EscapeDataString($guestId)
 
     # Two different audiences, two different messages, both editable in the
     # portal. The owner's is gated by the notification setting; the guest's is a

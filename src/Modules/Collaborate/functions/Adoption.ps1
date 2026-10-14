@@ -133,23 +133,43 @@ function Get-CBAdoptionExpiry {
         that is respected: something (an earlier install, another tool, a manual
         process) already decided, and overwriting it would throw away a real
         decision. Otherwise they get adoption.initialDays counted from today.
+
+        Adoption never ends access by itself: a date already passed, or too close
+        for the owner to get every reminder, is moved out to that minimum.
+    .PARAMETER SpreadDays
+        Spreads new end dates over this many days, per guest id, so a large
+        adoption batch does not all expire on one day and trip the storm guard.
     .OUTPUTS
         @{ ExpiresOn; Source }
     #>
-    [CmdletBinding()] param([Parameter(Mandatory)]$User, $Settings, [datetime]$Now = [datetime]::MinValue)
+    [CmdletBinding()] param([Parameter(Mandatory)]$User, $Settings, [datetime]$Now = [datetime]::MinValue, [int]$SpreadDays = 1)
     if (-not $Settings) { $Settings = Get-CBSettings }
     $attribute = "$($Settings.expiry.attribute)"
+    $initial = [int]$Settings.adoption.initialDays
+    $warnDays = (@($Settings.expiry.reminderDays) | ForEach-Object { [int]$_ } | Measure-Object -Maximum).Maximum
+    $floorDays = [Math]::Min($initial, [int]$warnDays + 1)
+    $floor = (ConvertTo-CBUtcMoment -Value $Now).Date.AddDays($floorDays)
+
     $existing = ''
     if ($User.PSObject.Properties['onPremisesExtensionAttributes'] -and $User.onPremisesExtensionAttributes) {
         $existing = "$($User.onPremisesExtensionAttributes.$attribute)".Trim()
     }
     $parsed = ConvertTo-CBDateOnly -Value $existing
-    if ($parsed) {
+    if ($parsed -and $parsed -ge $floor) {
         return @{ ExpiresOn = $parsed.ToString('yyyy-MM-dd'); Source = "the date already on $attribute" }
     }
+    $offset = 0
+    if ($SpreadDays -gt 1) {
+        $hash = 0
+        foreach ($c in "$($User.id)".ToCharArray()) { $hash = ($hash * 31 + [int]$c) % 1000003 }
+        $offset = $hash % $SpreadDays
+    }
+    if ($parsed) {
+        return @{ ExpiresOn = $floor.AddDays($offset).ToString('yyyy-MM-dd'); Source = "$($floorDays + $offset) days from today, because the date on $attribute ($($parsed.ToString('yyyy-MM-dd'))) left no time for reminders" }
+    }
     return @{
-        ExpiresOn = (Get-CBExpiryDateString -Days ([int]$Settings.adoption.initialDays) -From $Now)
-        Source    = "$($Settings.adoption.initialDays) days from today"
+        ExpiresOn = (Get-CBExpiryDateString -Days ($initial + $offset) -From $Now)
+        Source    = "$($initial + $offset) days from today"
     }
 }
 
@@ -160,12 +180,12 @@ function Invoke-CBGuestAdoptionRecord {
     .OUTPUTS
         @{ Adopted; Orphaned; Reason }
     #>
-    [CmdletBinding()] param([Parameter(Mandatory)]$User, $Settings, [datetime]$Now = [datetime]::MinValue)
+    [CmdletBinding()] param([Parameter(Mandatory)]$User, $Settings, [datetime]$Now = [datetime]::MinValue, [int]$SpreadDays = 1)
     if (-not $Settings) { $Settings = Get-CBSettings }
     $guestId = "$($User.id)"
     $address = "$(@($User.mail, $User.userPrincipalName) | Where-Object { $_ } | Select-Object -First 1)"
     $owner = Resolve-CBAdoptionOwner -User $User -Settings $Settings
-    $expiry = Get-CBAdoptionExpiry -User $User -Settings $Settings -Now $Now
+    $expiry = Get-CBAdoptionExpiry -User $User -Settings $Settings -Now $Now -SpreadDays $SpreadDays
     $orphaned = -not $owner.OwnerId
 
     if ($Settings.dryRun) {
@@ -336,11 +356,14 @@ function Invoke-CBGuestAdoption {
         tenant can find thousands; doing them in batches keeps the run inside the
         function timeout and lets an operator watch the first batch before the
         rest follow tomorrow.
+    .PARAMETER BudgetSeconds
+        Stops early after this long, so adoption can never push the daily scan
+        past the function timeout and cost that day's reminders and expiries.
     .OUTPUTS
         @{ Adopted; Orphaned; Skipped; Remaining }
     #>
     [CmdletBinding()]
-    param($Directory, $Settings, [int]$Limit = 500, [datetime]$Now = [datetime]::MinValue)
+    param($Directory, $Settings, [int]$Limit = 500, [datetime]$Now = [datetime]::MinValue, [int]$BudgetSeconds = 600)
     if (-not $Settings) { $Settings = Get-CBSettings }
     if (-not $Settings.adoption.enabled) {
         Write-Host 'Adoption is switched off; guests that predate the tool are left alone.'
@@ -354,11 +377,18 @@ function Invoke-CBGuestAdoption {
 
     $adopted = 0; $orphaned = 0; $skipped = 0; $seen = 0
     $candidates = @($Directory.Keys | Where-Object { -not $tracked.ContainsKey($_) })
+    # Enough days that the whole backlog expires at no more than half the daily
+    # block cap per day, so adoption alone can never trip the storm guard.
+    $cap = [int]$Settings.safety.dailyCapBlock
+    $perDay = [Math]::Max(1, [Math]::Floor($(if ($cap -gt 0) { $cap } else { 100 }) / 2))
+    $spread = [int][Math]::Min(180, [Math]::Max(1, [Math]::Ceiling($candidates.Count / $perDay)))
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
     foreach ($id in $candidates) {
         if ($seen -ge $Limit) { break }
+        if ($clock.Elapsed.TotalSeconds -ge $BudgetSeconds) { Write-Host "Adoption stopped after $BudgetSeconds seconds; the rest follow tomorrow."; break }
         $seen++
         try {
-            $result = Invoke-CBGuestAdoptionRecord -User $Directory[$id] -Settings $Settings -Now $Now
+            $result = Invoke-CBGuestAdoptionRecord -User $Directory[$id] -Settings $Settings -Now $Now -SpreadDays $spread
             if ($result.Adopted) { $adopted++ } else { $skipped++ }
             if ($result.Orphaned) { $orphaned++ }
         }

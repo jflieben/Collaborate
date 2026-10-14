@@ -15,10 +15,13 @@ big buttons. Administrators additionally get the tabs that configure everything.
 - The enterprise app does **not** require assignment by default, so every internal member
   can sign in and manage the guests they own. Administration comes from the
   `Collaborate.Admin` app role that has to be assigned explicitly
-- **Guests cannot sign in.** The API refuses a token whose `acct` claim marks the
-  caller as a guest, or whose tenant is not this one.
+- **Guests cannot sign in.** The API refuses a token from another tenant or a
+  guest identity provider, and checks the caller's `userType` in Entra (cached
+  for an hour), which also catches guests that sign in with credentials in this
+  tenant.
 - The API validates every request itself (RS256 against the tenant JWKS,
-  audience, issuer, expiry) in addition to App Service Easy Auth.
+  audience, exact issuer, tenant, expiry). Easy Auth runs in `AllowAnonymous`
+  mode, so that check is the gate.
 
 ## First run: the setup wizard
 
@@ -70,6 +73,19 @@ ended, ending soon, waiting to be accepted, and finally the ones that are fine.
 Administrators get a toggle for every
 external account in the tenant, with the colleague accountable for each and
 anything unowned called out.
+
+A search box filters on name, email and reason, and clicking a status count
+("3 ending soon") filters to that state. Selecting rows offers **Extend
+selected** and **End access for selected**, each confirming the names first and
+only including rows where that action is available. **Download as CSV** exports
+exactly the rows shown.
+
+### Links into the portal
+
+Every tab has its own address (`#guests`, `#log`, `#config` and so on), and
+`#guest/<id>` opens one collaborator's panel; `#guest/<id>/renew` opens it on
+Extend. Reminder and "access ended" mails link there, so extending is one click
+from the mail. The address survives the sign-in redirect.
 
 ### Opening a collaborator
 
@@ -226,3 +242,9 @@ The choice is also cached in `localStorage`
   `-PublicWithSso` when people work from home and you rely on Conditional Access
   instead.
 - `msal-browser.min.js` is bundled locally rather than loaded from a CDN.
+- The page carries a `Content-Security-Policy` in a meta tag (a storage static
+  website cannot send headers). It allows the API on `*.azurewebsites.net`; if
+  you put the API behind a custom domain, add it to `connect-src` in
+  `web/index.html`. Framing cannot be blocked from a meta tag, so the page hides
+  itself when framed; real `frame-ancestors` protection needs a front door that
+  can send headers.

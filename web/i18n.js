@@ -16,7 +16,7 @@
 
   var NL = {
     /* --- shell --- */
-    "Invite and manage the people you work with outside the company.": "Nodig mensen buiten het bedrijf uit en beheer ze.",
+    "Invite and work with external people.": "Nodig externe mensen uit en werk samen.",
     "Sign in": "Aanmelden",
     "You will be signed in with your work account.": "U wordt aangemeld met uw werkaccount.",
     "Sign out": "Afmelden",
@@ -31,7 +31,6 @@
 
     /* --- home --- */
     "What would you like to do?": "Wat wilt u doen?",
-    "Everything you set up here is recorded against your name, with an end date, so nothing is left open forever.": "Alles wat u hier regelt staat op uw naam, met een einddatum, zodat niets eindeloos openblijft.",
     "Collaborate is waking up. This takes a few seconds the first time somebody opens it after a quiet period.": "Collaborate wordt opgestart. De eerste keer na een rustige periode duurt dat een paar seconden.",
     "<span class=\"spinner\"></span> Getting things ready...": "<span class=\"spinner\"></span> Bezig met voorbereiden...",
     "Sharing: <strong id=\"shChosen\"></strong>": "Delen: <strong id=\"shChosen\"></strong>",
@@ -400,6 +399,8 @@
     "changed since we published it": "gewijzigd sinds publicatie",
     "all accounted for": "allemaal toegewezen",
     "up to date": "up-to-date",
+    "the deployed code is older": "de uitgerolde code is ouder",
+    "Configured as {version}, but the code running is {code}.": "Ingesteld als {version}, maar de draaiende code is {code}.",
     "{n} with no owner": "{n} zonder eigenaar",
     "{n} external account(s) in the tenant.": "{n} extern(e) account(s) in de tenant.",
     "{version} is available": "{version} is beschikbaar",
@@ -554,7 +555,204 @@
     "Reminders, expiry notices and digests are sent from here, and so is anything a browser could not send. Invitations come from whoever created them. Permission to send is scoped to this one mailbox in Exchange Online, so changing it means re-running the deployment, which is idempotent and safe against an existing install.": "Herinneringen, verloopberichten en overzichten worden hiervandaan verstuurd, net als alles wat een browser niet kon versturen. Uitnodigingen komen van degene die ze heeft aangemaakt. De verzendmachtiging is in Exchange Online beperkt tot deze ene mailbox, dus wijzigen betekent de installatie opnieuw uitvoeren; die is idempotent en veilig op een bestaande installatie.",
     "The on-behalf-of exchange works.": "De on-behalf-of-uitwisseling werkt.",
     "Set during deployment.": "Ingesteld tijdens de installatie.",
-    "Confirm": "Bevestigen"
+    "Confirm": "Bevestigen",
+
+    /* sign-in and start-up */
+    "You are not signed in.": "U bent niet aangemeld.",
+    "Could not get a sign-in token. Reload the page and try again.": "Er kon geen aanmeldtoken worden opgehaald. Laad de pagina opnieuw en probeer het nog eens.",
+    "Your session has expired. Signing you in again...": "Uw sessie is verlopen. U wordt opnieuw aangemeld...",
+    "Sign-in was refused: {error}": "Aanmelden is geweigerd: {error}",
+    "Could not sign you in: {error}": "U kon niet worden aangemeld: {error}",
+    "Collaborate could not start: {error}": "Collaborate kon niet starten: {error}",
+    "If this persists, an administrator can check the Function App is running.": "Blijft dit gebeuren, dan kan een beheerder controleren of de Function App draait.",
+    "The sign-in library could not be loaded. Check your network or content filtering, then reload.": "De aanmeldbibliotheek kon niet worden geladen. Controleer uw netwerk of contentfilter en laad de pagina opnieuw.",
+    "Sign-in is not configured yet: authConfig.js still holds placeholders. Finish the deployment step that writes it.": "Aanmelden is nog niet ingesteld: authConfig.js bevat nog plaatsaanduidingen. Voltooi de installatiestap die dit bestand schrijft.",
+    "The server returned {status}.": "De server gaf {status} terug.",
+    "Sections": "Onderdelen",
+    "Unsaved changes": "Niet-opgeslagen wijzigingen",
+    "Could not copy. Select the text and copy it.": "Kopiëren is mislukt. Selecteer de tekst en kopieer die zelf.",
+    "Select the text and copy it.": "Selecteer de tekst en kopieer die zelf.",
+    "The message could not be sent from your mailbox. It will be sent from the service desk shortly.": "Het bericht kon niet vanuit uw mailbox worden verstuurd. Het wordt binnenkort vanuit de servicedesk verstuurd.",
+
+    /* resuming after a pause */
+    "Resume": "Hervatten",
+    "Resume processing?": "Verwerking hervatten?",
+    "It paused because: {reason}": "Gepauzeerd omdat: {reason}",
+    "no reason was recorded": "er is geen reden vastgelegd",
+    "Resuming lets everything that is queued go ahead now, and resets today's safety counters. Check the reason above first.": "Hervatten laat alles wat in de wachtrij staat nu doorgaan en zet de veiligheidstellers van vandaag op nul. Controleer eerst de reden hierboven.",
+    "Resume now": "Nu hervatten",
+    "Processing resumed.": "Verwerking is hervat.",
+
+    /* the collaborator list: search, counts, selection, export */
+    "Search collaborators": "Externe gasten zoeken",
+    "Search by name, email or reason": "Zoek op naam, e-mailadres of reden",
+    "Download as CSV": "Downloaden als CSV",
+    "{count} person": "{count} persoon",
+    "{count} people": "{count} personen",
+    "{count} switched off": "{count} uitgezet",
+    "{count} ended": "{count} beëindigd",
+    "{count} ending soon": "{count} loopt bijna af",
+    "{count} waiting to accept": "{count} wacht op acceptatie",
+    "who contains \"{text}\"": "wie bevat \"{text}\"",
+    "status: {states}": "status: {states}",
+    "Filtered by {filters}": "Gefilterd op {filters}",
+    "Select {name}": "{name} selecteren",
+    "Extend selected": "Selectie verlengen",
+    "End access for selected": "Toegang van selectie beëindigen",
+    "Extend access for {count}": "Toegang verlengen voor {count}",
+    "End access for {count}": "Toegang beëindigen voor {count}",
+    "{count} of the selected cannot be extended and are left out.": "{count} van de geselecteerde kunnen niet worden verlengd en worden overgeslagen.",
+    "{count} of the selected have already ended and are left out.": "{count} van de geselecteerde zijn al beëindigd en worden overgeslagen.",
+    "Extend them": "Verlengen",
+    "End their access": "Toegang beëindigen",
+    "Choose between 1 and {max} days.": "Kies tussen 1 en {max} dagen.",
+    "Working... {done} of {total}": "Bezig... {done} van {total}",
+    "{ok} done, {failed} failed.": "{ok} gelukt, {failed} mislukt.",
+    "All {count} done.": "Alle {count} gelukt.",
+    "{name}: {error}": "{name}: {error}",
+    "And {count} more failed.": "En nog {count} mislukt.",
+    "Assigning {count}...": "Bezig met toewijzen van {count}...",
+    "Name": "Naam",
+    "Email": "E-mail",
+    "End date": "Einddatum",
+    "Reason": "Reden",
+
+    /* one collaborator, and what can be done */
+    "once": "één keer",
+    "{count} times": "{count} keer",
+    "You": "U",
+    "somebody else": "iemand anders",
+    "Add to a Team": "Aan een Team toevoegen",
+    "{name} is no longer shared.": "{name} wordt niet meer gedeeld.",
+    "{action}: {reason}": "{action}: {reason}",
+    "Entra keeps removed accounts for 30 days. Restoring returns the same account, so anything shared with them before works again.": "Entra bewaart verwijderde accounts 30 dagen. Herstellen brengt hetzelfde account terug, zodat alles wat eerder met deze persoon is gedeeld weer werkt.",
+    "Sign-in is switched back on and a new end date is set from today.": "Aanmelden wordt weer aangezet en er wordt een nieuwe einddatum vanaf vandaag ingesteld.",
+    "A new end date is set from today, not added to the current one.": "Er wordt een nieuwe einddatum vanaf vandaag ingesteld; die wordt niet bij de huidige opgeteld.",
+    "Sign-in is switched off straight away. The account is kept for the grace period, so you can undo this by extending them again.": "Aanmelden wordt direct uitgezet. Het account blijft bewaard tijdens de respijtperiode, zodat u dit ongedaan kunt maken door opnieuw te verlengen.",
+    "Nobody is accountable for this collaborator at the moment. You become their owner, they get an end date like everybody else, and the reminders come to you.": "Op dit moment is niemand verantwoordelijk voor deze externe gast. U wordt de eigenaar, de gast krijgt net als iedereen een einddatum en de herinneringen komen naar u.",
+    "Nobody is accountable for this collaborator, so you can pick yourself here as well as a colleague. Whoever you pick gets the reminders from now on.": "Niemand is verantwoordelijk voor deze externe gast, dus u kunt hier uzelf of een collega kiezen. Wie u kiest, krijgt voortaan de herinneringen.",
+    "They become accountable for this collaborator and get the reminders from now on. You will no longer see them in your list.": "Uw collega wordt verantwoordelijk voor deze externe gast en krijgt voortaan de herinneringen. U ziet de gast daarna niet meer in uw lijst.",
+    "A fresh link is issued for the same account, so the end date and anything already shared with them are kept.": "Er wordt een nieuwe link uitgegeven voor hetzelfde account, dus de einddatum en alles wat al is gedeeld blijven behouden.",
+    "{name} now has access until {until}.": "{name} heeft nu toegang tot {until}.",
+    "Access ended for {name}.": "Toegang beëindigd voor {name}.",
+    "{name} is on your list now, until {until}.": "{name} staat nu op uw lijst, tot {until}.",
+    "Handed over.": "Overgedragen.",
+    "A fresh invitation is on its way.": "Er is een nieuwe uitnodiging onderweg.",
+    "optional": "optioneel",
+
+    /* inviting */
+    "yours": "van u",
+    "owned by {name}": "van {name}",
+    "nobody looks after them": "niemand beheert deze persoon",
+    "not tracked yet": "nog niet gevolgd",
+    "People we already work with:": "Mensen met wie we al samenwerken:",
+    "Nobody here by that address": "Niemand met dat adres",
+    "Already yours": "Al van u",
+    "Somebody already works with them": "Iemand werkt al met deze persoon samen",
+    "They exist, but nobody owns them": "Deze persoon bestaat, maar heeft geen eigenaar",
+    "That is a colleague": "Dat is een collega",
+    "That address cannot be invited": "Dat adres kan niet worden uitgenodigd",
+    "Enter a full email address to continue.": "Vul een volledig e-mailadres in om door te gaan.",
+    "Checking...": "Bezig met controleren...",
+    "Why do you need to work with them? (optional)": "Waarom moet u met deze persoon samenwerken? (optioneel)",
+    "Why do you work with them? (optional)": "Waarom werkt u met deze persoon samen? (optioneel)",
+    "Send them a note (optional)": "Stuur een bericht mee (optioneel)",
+    "Could you share the proposal folder with them?": "Kunt u de map met het voorstel met deze persoon delen?",
+    "Ask {name}": "Vraag het {name}",
+    "Ask the owner": "Vraag het de eigenaar",
+    "Open your collaborators": "Open uw externe gasten",
+    "Inviting...": "Bezig met uitnodigen...",
+    "Sending...": "Bezig met versturen...",
+    "Message sent.": "Bericht verstuurd.",
+    "Simulation mode is on, so nothing was actually done.": "Simulatiemodus staat aan, dus er is niets echt gedaan.",
+    "{name} has been invited. Their access runs until {until}.": "{name} is uitgenodigd. De toegang loopt tot {until}.",
+    "{name} is now on your list, with access until {until}.": "{name} staat nu op uw lijst, met toegang tot {until}.",
+    "{name} would have been set up until {until}.": "{name} zou zijn ingesteld tot {until}.",
+    "{email}, until {until}": "{email}, tot {until}",
+
+    /* sharing */
+    "You will only see what you can already open yourself. Only folders can be shared here; open one to look inside.": "U ziet alleen wat u zelf al kunt openen. Hier kunnen alleen mappen worden gedeeld; open er een om erin te kijken.",
+    "Open ↗": "Openen ↗",
+    "Add a guest": "Een gast toevoegen",
+    "Nobody we already work with matches that.": "Niemand met wie we al samenwerken komt hiermee overeen.",
+    "not set up here yet": "hier nog niet ingesteld",
+    "Checking {email}...": "{email} wordt gecontroleerd...",
+    "Invite {email}": "{email} uitnodigen",
+    "They will be set up as an external collaborator owned by you, with an end date, and given access to this in the same step.": "Deze persoon wordt in dezelfde stap op uw naam ingesteld als externe gast, met een einddatum, en krijgt hier meteen toegang toe.",
+    "Share with {name}": "Delen met {name}",
+    "{email}, will be invited now": "{email}, wordt nu uitgenodigd",
+    "{email}, already works with us": "{email}, werkt al met ons samen",
+    "Add to the Team": "Aan het Team toevoegen",
+    "Shared.": "Gedeeld.",
+    "SharePoint refused a share from here on {date}.": "SharePoint weigerde op {date} een deling vanaf hier.",
+    "{name} was set up, but the share itself failed. Press Share to try just the share again.": "{name} is ingesteld, maar het delen zelf is mislukt. Klik op Delen om alleen het delen opnieuw te proberen.",
+    "SharePoint does not allow external sharing here.": "SharePoint staat hier extern delen niet toe.",
+    "SharePoint does not allow external sharing in this tenant.": "SharePoint staat extern delen in deze tenant niet toe.",
+    "Site sharing status is unavailable.": "De deelstatus van de site is niet beschikbaar.",
+
+    /* admin tabs */
+    "Configuration saved.": "Instellingen opgeslagen.",
+    "Emails saved.": "E-mails opgeslagen.",
+    "Reset to the shipped wording.": "Teruggezet naar de standaardtekst.",
+    "Saved. The portal, your emails and the public page all use this now.": "Opgeslagen. Het portaal, uw e-mails en de openbare pagina gebruiken dit nu allemaal.",
+    "That image is larger than 512 KB.": "Die afbeelding is groter dan 512 KB.",
+    "(not configured)": "(niet ingesteld)",
+    "(unknown)": "(onbekend)",
+    "Insert this into the body": "Dit in de inhoud invoegen",
+    "{label} (to the guest)": "{label} (aan de gast)",
+    "{label} (to the owner)": "{label} (aan de eigenaar)",
+    "{label} (to the admin)": "{label} (aan de beheerder)",
+    "These placeholders are not available in this message and will come out empty: {tokens}": "Deze plaatsaanduidingen zijn in dit bericht niet beschikbaar en blijven leeg: {tokens}",
+    "Sent to {address}.": "Verstuurd naar {address}.",
+    "Nothing was sent.": "Er is niets verstuurd.",
+
+    /* activity */
+    "Filter what is loaded": "Filter wat is geladen",
+    "name, event or detail": "naam, gebeurtenis of detail",
+    "Collaborator": "Externe gast",
+    "simulated": "gesimuleerd",
+    "Nothing loaded so far matches that.": "Niets van wat tot nu toe is geladen komt hiermee overeen.",
+
+    /* diagnostics */
+    "Reading Entra...": "Bezig met lezen uit Entra...",
+    "Looking for guests we do not track...": "Bezig met zoeken naar gasten die we niet volgen...",
+    "Checking for unowned accounts...": "Bezig met zoeken naar accounts zonder eigenaar...",
+    "Running the checks...": "Bezig met de controles...",
+    "Done.": "Klaar.",
+    "The deployed code is out of date": "De uitgerolde code is verouderd",
+    "This app is configured as version {version} but the code running is {code}. A zip deployment reports success as soon as the package uploads, so this happens when the package did not actually land. Re-run <strong>deploy/Update-Collaborate.ps1</strong> and check its output for functions that did not register. Until this matches, expect endpoints to 404 and settings changes not to take effect.": "Deze app is ingesteld als versie {version}, maar de draaiende code is {code}. Een zip-implementatie meldt succes zodra het pakket is geüpload, dus dit gebeurt als het pakket niet echt is aangekomen. Voer <strong>deploy/Update-Collaborate.ps1</strong> opnieuw uit en controleer in de uitvoer welke functies niet zijn geregistreerd. Zolang dit niet overeenkomt, kunnen endpoints 404 geven en worden gewijzigde instellingen niet toegepast.",
+    "Functions the running code provides: {list}": "Functies die de draaiende code levert: {list}",
+
+    /* the setup wizard */
+    "Make it yours": "Maak het helemaal van u",
+    "This is what your people and your guests will see. You can change all of it later.": "Dit is wat uw mensen en uw gasten zien. U kunt alles later nog wijzigen.",
+    "The logo is uploaded on the Branding tab once setup is done.": "Het logo uploadt u op het tabblad Huisstijl zodra de installatie klaar is.",
+    "Every guest gets an end date. Before it arrives the owner is reminded; after it passes, sign-in is blocked and the account is only removed once the grace period is over.": "Elke gast krijgt een einddatum. Daarvoor krijgt de eigenaar een herinnering; daarna wordt aanmelden geblokkeerd en wordt het account pas verwijderd als de respijtperiode voorbij is.",
+    "Default length in days": "Standaardduur in dagen",
+    "Longest anybody may choose": "Langste duur die iemand mag kiezen",
+    "Grace period before deletion, in days": "Respijtperiode voor verwijdering, in dagen",
+    "Remind the owner this many days before": "Herinner de eigenaar zoveel dagen vooraf",
+    "Store the end date on": "Bewaar de einddatum op",
+    "The end date is written onto the guest account itself, so it outlives this tool. Pick an attribute nothing else uses: the check on the last step verifies that.": "De einddatum wordt op het gastaccount zelf gezet, zodat die deze tool overleeft. Kies een attribuut dat nergens anders voor wordt gebruikt: de controle bij de laatste stap verifieert dat.",
+    "Who may invite": "Wie mag uitnodigen",
+    "Leave the group empty and any internal member can invite an external person. Everybody can always manage the guests they already own.": "Laat de groep leeg en elke interne medewerker kan een externe uitnodigen. Iedereen kan altijd de gasten beheren die al van hen zijn.",
+    "Object id of the group allowed to invite (optional)": "Object-id van de groep die mag uitnodigen (optioneel)",
+    "Group name, shown to anybody who is refused": "Groepsnaam, getoond aan wie wordt geweigerd",
+    "Service desk email (where health warnings are sent to)": "E-mailadres servicedesk (waar gezondheidswaarschuwingen naartoe gaan)",
+    "Invitations are sent from the mailbox of whoever creates them, from their own browser. Reminders, expiry notices and digests come from the shared mailbox, because nobody is signed in when those are sent.": "Uitnodigingen worden verstuurd vanuit de mailbox van degene die ze aanmaakt, vanuit diens eigen browser. Herinneringen, verloopberichten en overzichten komen uit de gedeelde mailbox, omdat er dan niemand is aangemeld.",
+    "These run as the person using the portal, never as the service, so nobody can share something they do not already have access to. Switch off anything you do not want offered.": "Dit gebeurt namens de persoon die het portaal gebruikt, nooit namens de service, dus niemand kan iets delen waar hij zelf geen toegang toe heeft. Zet uit wat u niet wilt aanbieden.",
+    "Share files": "Bestanden delen",
+    "Share folders": "Mappen delen",
+    "Add guests to Teams": "Gasten aan Teams toevoegen",
+    "Allow edit access, not only view": "Bewerkrechten toestaan, niet alleen bekijken",
+    "Collaborate starts in simulation mode: it will log what it would do and change nothing until you turn that off in Configuration.": "Collaborate start in simulatiemodus: het legt vast wat het zou doen en wijzigt niets tot u dat uitzet bij Instellingen.",
+    "Check and finish": "Controleren en afronden",
+    "Before finishing, Collaborate verifies that single sign-on is genuinely being enforced, that it can act on your behalf, and that the attribute you chose is free.": "Voor het afronden controleert Collaborate of eenmalige aanmelding echt wordt afgedwongen, of het namens u kan handelen en of het gekozen attribuut vrij is.",
+    "<span class=\"spinner\"></span> Running the checks...": "<span class=\"spinner\"></span> Bezig met de controles...",
+    "Finish setup": "Installatie afronden",
+    "Checking and finishing...": "Bezig met controleren en afronden...",
+    "Fix the items marked with a cross, then try again.": "Los de punten met een kruis op en probeer het opnieuw.",
+    "Setup is complete. Single sign-on is verified and enforced.": "De installatie is voltooid. Eenmalige aanmelding is geverifieerd en wordt afgedwongen."
   };
 
   /* Sentences the API composes around a date or a count. They cannot be keys as
@@ -581,7 +779,6 @@
     [/^Access switched off \(ended (.+)\)$/, "Toegang uitgeschakeld (geëindigd {1})"],
     [/^Accepted (.+)$/, "Geaccepteerd {1}"],
     [/^Invited (.+), not accepted yet$/, "Uitgenodigd {1}, nog niet geaccepteerd"],
-    [/^Ask (.+)$/, "Vraag het {1}"],
     [/^(\d+) selected$/, "{1} geselecteerd"]
   ];
 
@@ -648,6 +845,13 @@
   var INLINE = { EM: 1, STRONG: 1, B: 1, I: 1, CODE: 1, SPAN: 1, A: 1, BR: 1 };
   var SKIP_TAG = { SCRIPT: 1, STYLE: 1, TEXTAREA: 1 };
 
+  // Data (names, reasons, file names) is marked data-i18n-skip, on the element
+  // or an ancestor, so a file called "Recent" stays "Recent".
+  function skipped(node) {
+    var e = node && (node.nodeType === 1 ? node : node.parentElement);
+    return !!(e && e.closest && e.closest("[data-i18n-skip]"));
+  }
+
   function translateElement(el) {
     if (!el || SKIP_TAG[el.tagName]) { return; }
     if (el.hasAttribute && el.hasAttribute("data-i18n-skip")) { return; }
@@ -702,7 +906,7 @@
   var installed = false;
 
   function translateDom(root) {
-    if (current === "en" || busy) { return; }
+    if (current === "en" || busy || skipped(root)) { return; }
     busy = true;
     try { translateElement(root || document.body); } finally { busy = false; }
   }
@@ -728,13 +932,13 @@
       configurable: true,
       get: text.get,
       set: function (value) {
-        text.set.call(this, (busy || value == null || value === "") ? value : t(value));
+        text.set.call(this, (busy || value == null || value === "" || skipped(this)) ? value : t(value));
       }
     });
 
     var setAttr = Element.prototype.setAttribute;
     Element.prototype.setAttribute = function (name, value) {
-      if (!busy && ATTRS[name] && value) { value = t(value); }
+      if (!busy && ATTRS[name] && value && !skipped(this)) { value = t(value); }
       return setAttr.call(this, name, value);
     };
 
@@ -747,7 +951,7 @@
       Object.defineProperty(host, prop, {
         configurable: true,
         get: d.get,
-        set: function (value) { d.set.call(this, (busy || !value) ? value : t(value)); }
+        set: function (value) { d.set.call(this, (busy || !value || skipped(this)) ? value : t(value)); }
       });
     });
   }

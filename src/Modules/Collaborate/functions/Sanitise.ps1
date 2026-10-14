@@ -239,6 +239,31 @@ function Test-CBUrlAllowed {
     return $false
 }
 
+$script:CBSharedSuffixes = @(
+    'sharepoint.com', 'onmicrosoft.com', 'microsoft.com', 'office.com', 'office365.com', 'live.com',
+    'azurewebsites.net', 'core.windows.net', 'cloudapp.net', 'cloudapp.azure.com', 'azurestaticapps.net', 'azureedge.net', 'azurefd.net', 'trafficmanager.net',
+    'github.io', 'herokuapp.com', 'netlify.app', 'vercel.app', 'pages.dev', 'workers.dev', 'appspot.com', 'firebaseapp.com', 'web.app',
+    'amazonaws.com', 'cloudfront.net', 'blogspot.com', 'wordpress.com', 'ngrok.io', 'ngrok-free.app'
+)
+
+function Test-CBSharedSuffix {
+    <#
+    .SYNOPSIS
+        True for a domain under which strangers can get a host name: a hosting
+        platform, or a bare public suffix such as co.uk.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$Domain)
+    $d = $Domain.Trim('.').ToLowerInvariant()
+    foreach ($suffix in $script:CBSharedSuffixes) {
+        if ($d -eq $suffix -or $d.EndsWith(".$suffix")) { return $true }
+    }
+    # A two-label name with a short second-level label under a country code
+    # (co.uk, com.au, or.jp) is a registry, not an organisation.
+    $labels = $d.Split('.')
+    if ($labels.Count -eq 2 -and $labels[1].Length -eq 2 -and $labels[0].Length -le 3) { return $true }
+    return ($labels.Count -lt 2)
+}
+
 function ConvertTo-CBHostList {
     <#
     .SYNOPSIS
@@ -256,6 +281,10 @@ function ConvertTo-CBHostList {
         $leadingDot = $h.StartsWith('.')
         $bare = $h.TrimStart('.')
         if (-not (Test-CBDomainName -Domain $bare)) { continue }
+        # "And subdomains" of a suffix anyone can register under (another
+        # tenant's SharePoint, any web app, co.uk) would make the welcome page an
+        # open redirect.
+        if ($leadingDot -and (Test-CBSharedSuffix -Domain $bare)) { continue }
         $normalised = if ($leadingDot) { ".$bare" } else { $bare }
         if ($out -notcontains $normalised) { $out.Add($normalised) }
         if ($out.Count -ge $MaxItems) { break }

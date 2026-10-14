@@ -10,8 +10,14 @@
         iex (irm https://raw.githubusercontent.com/jflieben/Collaborate/main/install.ps1)
 
     Anything you do not pass is prompted for, so the one-liner is fully
-    interactive. To run unattended or pin a version, download it and pass
-    parameters instead:
+    interactive. To pin a release in one line (each release's notes show it):
+
+        & ([scriptblock]::Create((irm https://raw.githubusercontent.com/jflieben/Collaborate/v1.2.0/install.ps1))) -Version 1.2.0
+
+    The downloaded packages are checked against the release's .sha256 files.
+    Set GITHUB_TOKEN to avoid GitHub's unauthenticated rate limit.
+
+    To run unattended, download it and pass parameters instead:
 
         irm https://raw.githubusercontent.com/jflieben/Collaborate/main/install.ps1 -OutFile install.ps1
         ./install.ps1 -SubscriptionId <sub> -Location westeurope `
@@ -67,8 +73,18 @@ Write-Host ''
 $apiBase = "https://api.github.com/repos/$Repo/releases"
 $releaseUri = if ($Version) { "$apiBase/tags/$(if ($Version.StartsWith('v')) { $Version } else { "v$Version" })" } else { "$apiBase/latest" }
 Write-Host "Looking up the release from $Repo ..."
-try { $release = Invoke-RestMethod -Uri $releaseUri -Headers @{ 'User-Agent' = 'collaborate-installer' } -ErrorAction Stop }
-catch { throw "Could not find that release in $Repo. Check the -Version value, or omit it for the latest." }
+$apiHeaders = @{ 'User-Agent' = 'collaborate-installer' }
+# A token lifts GitHub's unauthenticated limit (60 requests an hour per address).
+if ($env:GITHUB_TOKEN) { $apiHeaders.Authorization = "Bearer $($env:GITHUB_TOKEN)" }
+try { $release = Invoke-RestMethod -Uri $releaseUri -Headers $apiHeaders -ErrorAction Stop }
+catch {
+    $status = 0
+    if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+    if ($status -eq 403 -or $status -eq 429) {
+        throw "GitHub refused the request ($status), most likely its rate limit for unauthenticated calls from this address. Wait an hour, or set the GITHUB_TOKEN environment variable to a GitHub token and run this again."
+    }
+    throw "Could not find that release in $Repo. Check the -Version value, or omit it for the latest."
+}
 
 $tag = $release.tag_name
 Write-Host "Installing $tag" -ForegroundColor Green
@@ -76,6 +92,21 @@ Write-Host "Installing $tag" -ForegroundColor Green
 $srcAsset = $release.assets | Where-Object { $_.name -like 'Collaborate-src-*.zip' } | Select-Object -First 1
 $webAsset = $release.assets | Where-Object { $_.name -like 'Collaborate-web-*.zip' } | Select-Object -First 1
 if (-not $srcAsset -or -not $webAsset) { throw "Release $tag does not carry the expected assets." }
+$srcSumAsset = $release.assets | Where-Object { $_.name -eq "$($srcAsset.name).sha256" } | Select-Object -First 1
+$webSumAsset = $release.assets | Where-Object { $_.name -eq "$($webAsset.name).sha256" } | Select-Object -First 1
+if (-not $srcSumAsset -or -not $webSumAsset) { throw "Release $tag does not carry the .sha256 checksums for its packages, so they cannot be verified." }
+
+function Assert-Checksum {
+    # Compares a downloaded file with the "<hash>  <name>" line CI publishes.
+    param([string]$Path, [string]$SumUri, [string]$Name)
+    $sumFile = "$Path.sha256"
+    Invoke-WebRequest -Uri $SumUri -OutFile $sumFile -ErrorAction Stop
+    $expected = ((Get-Content -Path $sumFile -Raw).Trim() -split '\s+')[0]
+    $actual = (Get-FileHash -Path $Path -Algorithm SHA256).Hash
+    if (-not $expected -or $actual -ne $expected) {
+        throw "Checksum mismatch for ${Name}: expected '$expected', got '$actual'. Refusing to install."
+    }
+}
 
 $work = Join-Path ([System.IO.Path]::GetTempPath()) "collaborate-$([Guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Path $work -Force | Out-Null
@@ -85,6 +116,9 @@ try {
     $webZip = Join-Path $work 'web.zip'
     Invoke-WebRequest -Uri $srcAsset.browser_download_url -OutFile $srcZip -ErrorAction Stop
     Invoke-WebRequest -Uri $webAsset.browser_download_url -OutFile $webZip -ErrorAction Stop
+    Assert-Checksum -Path $srcZip -SumUri $srcSumAsset.browser_download_url -Name $srcAsset.name
+    Assert-Checksum -Path $webZip -SumUri $webSumAsset.browser_download_url -Name $webAsset.name
+    Write-Host 'Checksums verified.'
     Expand-Archive -Path $srcZip -DestinationPath (Join-Path $work 'src') -Force
     Expand-Archive -Path $webZip -DestinationPath (Join-Path $work 'web') -Force
 

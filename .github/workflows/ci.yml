@@ -14,7 +14,7 @@ jobs:
     name: Analyze + test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Install PSScriptAnalyzer + Pester
         shell: pwsh
@@ -51,14 +51,14 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Read version and check for an existing release
         id: ver
         shell: pwsh
         run: |
           $version = (Get-Content ./VERSION -Raw).Trim()
-          if ($version -notmatch '^\d+(\.\d+){0,3}$') { throw "VERSION '$version' is not a valid version." }
+          if ($version -notmatch '^\d+(\.\d+){1,3}$') { throw "VERSION '$version' is not a valid version." }
           $tag = "v$version"
           # gh returns non-zero when the release is absent; capture that WITHOUT
           # failing the step (GitHub exits the step with the last $LASTEXITCODE).
@@ -81,6 +81,10 @@ jobs:
           $stage = Join-Path ([System.IO.Path]::GetTempPath()) 'src'
           Copy-Item ./src $stage -Recurse -Force
           Get-ChildItem $stage -Filter 'local.settings.json*' -Recurse -Force | Remove-Item -Force
+          # Stamp the staged manifest exactly as the deploy does, so the release
+          # zip reports its version. CB.Common.ps1 only defines functions.
+          . ./deploy/CB.Common.ps1
+          Set-CBPackageVersion -StagePath $stage -Version $version | Out-Null
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath "out/Collaborate-src-$version.zip" -Force
           Compress-Archive -Path ./web/* -DestinationPath "out/Collaborate-web-$version.zip" -Force
           Copy-Item ./install.ps1 out/install.ps1
@@ -114,7 +118,8 @@ jobs:
             }
           }
           if (-not $notes) { $notes = "Release $version." }
-          $installCmd = 'iex (irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1)'
+          # Pinned to this release: the installer at this tag, installing this version.
+          $installCmd = "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/${{ github.repository }}/${{ steps.ver.outputs.tag }}/install.ps1))) -Version $version"
           $notes = "$notes`n`n---`n**Install / update (Azure Cloud Shell, PowerShell):**`n`n``````powershell`n$installCmd`n``````"
           $notes | Out-File release-notes.md -Encoding utf8
           Write-Host '----- release notes -----'

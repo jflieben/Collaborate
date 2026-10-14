@@ -55,7 +55,7 @@ function Get-CBDefaultSettings {
         branding          = [ordered]@{
             companyName     = $company
             portalTitle     = 'External collaborators'
-            portalSubtitle  = 'Invite and manage the people you work with outside the company'
+            portalSubtitle  = 'Invite and manage the external people you work with'
             primaryColor    = '#0f5c8c'
             accentColor     = '#b8501f'
             logoFile        = ''

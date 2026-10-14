@@ -68,6 +68,13 @@ try {
     $incoming.setupComplete = $before.setupComplete
     $incoming.setupCompletedUtc = $before.setupCompletedUtc
     $incoming.setupCompletedBy = $before.setupCompletedBy
+    # The same locks as ConfigApi: the published hash is how tampering with the
+    # public page is detected, and the logo is only replaced through BrandingApi.
+    $incoming.welcome.publishedHash = $before.welcome.publishedHash
+    $incoming.welcome.publishedUtc = $before.welcome.publishedUtc
+    $incoming.branding.logoFile = $before.branding.logoFile
+    $incoming.branding.logoContentType = $before.branding.logoContentType
+    $incoming.branding.logoUpdatedUtc = $before.branding.logoUpdatedUtc
 
     if ($action -eq 'complete') {
         $result = Invoke-CBSetupTest -Caller $caller -Request $Request -Settings $incoming

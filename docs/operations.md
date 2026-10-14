@@ -97,10 +97,17 @@ for. Adoption gives each an owner and an end date. It looks in this order:
 the ordinary lifecycle takes it from there.
 
 The date is counted **from today**, never from when the account was created.
-A date already sitting on the account is respected.
+A date already sitting on the account is respected, unless it has passed or is
+too close for the owner to get every reminder; then it moves out to just past
+the widest reminder step.
 
-A first pass is capped at 500 guests, so a large tenant is adopted over several
-nights and an operator can watch the first batch before the rest follow.
+New dates are **spread over several days** so that a large backlog does not all
+expire on one day: no day gets more than half the daily block cap from adoption
+alone, which would otherwise trip the storm guard 90 days later.
+
+A pass is capped at 500 guests and ten minutes, so a large tenant is adopted
+over several nights, an operator can watch the first batch before the rest
+follow, and adoption can never push the daily scan past its timeout.
 
 ## Inactive guests
 
@@ -109,8 +116,11 @@ that was never used at all, which is the more common kind of sprawl: somebody
 invited for a project that never started, four years ago.
 
 - Needs **Entra ID P1 or P2** for sign-in data.
-- **Missing sign-in data means no action.** A tenant without the licence must not
-  have its guests treated as never having signed in.
+- **Missing sign-in data means no action.** A tenant without the licence, or a
+  guest the sign-in sweep did not return, is never treated as never having
+  signed in.
+- In simulation mode an inactive guest is only logged; their end date is not
+  touched.
 - Never signed in falls back to the invitation date, so a guest invited yesterday
   is never idle.
 - The threshold has a 30-day floor: anything shorter acts on people who are
@@ -118,6 +128,22 @@ invited for a project that never started, four years ago.
 - The strongest setting still only **ends access**, through the ordinary grace
   period. Nothing here deletes in one step.
 - The owner is warned once per guest unless you ask for repeats.
+
+## Accounts changed outside Collaborate
+
+Somebody may delete or disable a guest directly in Entra, for example during an
+incident. The scanner notices a removal (confirmed with a direct lookup, not
+just a missing entry in the listing), and ending access notices an account that
+was already switched off. Either way the record is marked as **ended outside
+Collaborate**, and only an administrator can bring that guest back. An owner
+cannot undo IT's decision with the tool's own rights.
+
+## When Graph refuses an action
+
+A block or removal Graph refuses for good (for example a guest holding a
+directory role) is recorded on the guest and in the activity log and is not
+retried, and it does not count toward the storm guard's daily limit. A removal
+of an account that is already gone counts as done.
 
 ## The health check
 
@@ -146,8 +172,13 @@ Records for guests that were removed age out on the same schedule.
 `VersionChecker` reads the published `VERSION` file, records the answer, and
 shows administrators a banner. It emails the service desk once per version.
 
-**Collaborate never updates itself.**. Re-run the deployment, or
-`Update-Collaborate.ps1`, when you are ready.
+**Collaborate never updates itself.** Re-run the deployment, or
+`Update-Collaborate.ps1`, when you are ready. The installer verifies the
+downloaded release against its published SHA-256 checksums.
+
+To remove everything, `Remove-Collaborate.ps1` finds the resource group from the
+Function App and refuses if the group holds anything Collaborate did not
+create; `-Force` overrides that.
 
 ## Network access, and not locking your employees out
 
@@ -163,6 +194,11 @@ The deploy helps with ip whitelisting:
   `ifconfig.me`.
 - `-AllowedIp` skips the prompt entirely
 - If nothing can be determined, the lockdown is **skipped with a warning**
+- Re-running sets the allowed addresses to **exactly** the set you give it, on
+  the API and on the portal's storage account. Addresses no longer listed are
+  removed, including any added by hand, so pass every range employees use, not
+  just the one you are deploying from.
+- `-PublicWithSso` on a re-run lifts an earlier lockdown.
 
 Enterprises will prefer to use WAF / VPN / Private Networking, which can easily be configured on the deployed resources by any Azure Engineer. We do not provide documentation for this (too many different ways to set it up).
 

@@ -80,9 +80,9 @@ try {
             # A user who may not invite at all is told here rather than after
             # they have filled in the form.
             canInvite = ([bool]$verdict.CanInvite -and [bool]$canInvite.Allowed)
-            canClaim  = [bool]$verdict.CanClaim
+            canClaim  = ([bool]$verdict.CanClaim -and [bool]$canInvite.Allowed)
             canAsk    = [bool]$verdict.CanAsk
-            inviteBlockedReason = $(if ($verdict.CanInvite -and -not $canInvite.Allowed) { $canInvite.Reason } else { '' })
+            inviteBlockedReason = $(if (($verdict.CanInvite -or $verdict.CanClaim) -and -not $canInvite.Allowed) { $canInvite.Reason } else { '' })
         }
         return
     }
@@ -149,6 +149,5 @@ try {
 }
 catch {
     Write-CBHeartbeatSampled -Name 'GuestsApi' -Status error -ErrorMessage $_.Exception.Message
-    Write-Error "GuestsApi failed: $($_.Exception.Message)"
-    Send-Json -Status 500 -Object @{ error = $_.Exception.Message }
+    Send-Json -Status 500 -Object (Get-CBErrorResponse -Caller $caller -ErrorRecord $_ -Name 'GuestsApi')
 }

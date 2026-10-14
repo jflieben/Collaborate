@@ -166,7 +166,10 @@ function Get-CBWelcomePageHtml {
 
   var link = document.getElementById("targetLink");
   var label = params.get("rl");
-  if (label) { link.textContent = String(label).slice(0, 80); }
+  // The label comes from the query string, so the real host is always shown
+  // next to it: a crafted label cannot hide where the link goes.
+  var host = new URL(target).hostname;
+  link.textContent = (label ? String(label).slice(0, 80) : link.textContent) + " (" + host + ")";
   link.setAttribute("href", target);
   document.getElementById("targetWrap").hidden = false;
   if (AUTO_REDIRECT) { window.setTimeout(function () { window.location.replace(target); }, 2500); }

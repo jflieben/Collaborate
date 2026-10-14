@@ -61,6 +61,5 @@ try {
     }
 }
 catch {
-    Write-Error "LogsApi failed: $($_.Exception.Message)"
-    Send-Json -Status 500 -Object @{ error = $_.Exception.Message }
+    Send-Json -Status 500 -Object (Get-CBErrorResponse -Caller $caller -ErrorRecord $_ -Name 'LogsApi')
 }

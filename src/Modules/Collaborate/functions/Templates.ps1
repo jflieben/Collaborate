@@ -81,7 +81,7 @@ function Get-CBEmailCatalog {
         [pscustomobject]@{
             key = 'guestAccepted'; label = 'Your guest accepted'; audience = 'owner'
             description = 'Sent to the internal owner when their guest redeems the invitation, so they know the access is live. Switched on and off by "Tell the owner when their guest accepts" in Configuration.'
-            tokens = $common + @('guest.displayName', 'guest.email', 'owner.displayName', 'expiresOn')
+            tokens = $common + @('guest.displayName', 'guest.email', 'owner.displayName', 'expiresOn', 'guestUrl')
             subject = '{{guest.displayName}} has accepted your invitation'
             body = @'
 <p>Hello {{owner.displayName}},</p>
@@ -93,14 +93,14 @@ function Get-CBEmailCatalog {
         [pscustomobject]@{
             key = 'ownerReminder'; label = 'Reminder to the owner'; audience = 'owner'
             description = 'Sent to the internal owner before a guest expires, once per reminder step you configure.'
-            tokens = $common + @('guest.displayName', 'guest.email', 'owner.displayName', 'expiresOn', 'daysLeft', 'reason')
+            tokens = $common + @('guest.displayName', 'guest.email', 'owner.displayName', 'expiresOn', 'daysLeft', 'reason', 'guestUrl')
             subject = 'Access for {{guest.displayName}} ends in {{daysLeft}} day(s)'
             body = @'
 <p>Hello {{owner.displayName}},</p>
 <p>The external access you arranged for <strong>{{guest.displayName}}</strong> ({{guest.email}}) ends on <strong>{{expiresOn}}</strong>, in {{daysLeft}} day(s).</p>
 <p><em>Original reason: {{reason}}</em></p>
 <p>If they still need it, extend it. If they do not, do nothing and the access ends automatically.</p>
-<p><a class="cb-button" href="{{brand.portalUrl}}">Review external collaborators</a></p>
+<p><a class="cb-button" href="{{guestUrl}}">Extend access</a></p>
 '@
         },
         [pscustomobject]@{
@@ -118,19 +118,19 @@ function Get-CBEmailCatalog {
         [pscustomobject]@{
             key = 'expiredBlocked'; label = 'Access ended'; audience = 'owner'
             description = 'Sent to the owner when a guest reaches their expiry date and sign-in is blocked. The account is kept for the grace period, so this is still reversible.'
-            tokens = $common + @('guest.displayName', 'guest.email', 'owner.displayName', 'expiresOn', 'graceDays', 'deleteOn')
+            tokens = $common + @('guest.displayName', 'guest.email', 'owner.displayName', 'expiresOn', 'graceDays', 'deleteOn', 'guestUrl')
             subject = 'Access ended for {{guest.displayName}}'
             body = @'
 <p>Hello {{owner.displayName}},</p>
 <p>The access you arranged for <strong>{{guest.displayName}}</strong> ({{guest.email}}) reached its end date on {{expiresOn}} and has been switched off.</p>
 <p>The account is kept until <strong>{{deleteOn}}</strong> ({{graceDays}} days), so if this was too soon you can restore it yourself in that window.</p>
-<p><a class="cb-button" href="{{brand.portalUrl}}">Restore or review</a></p>
+<p><a class="cb-button" href="{{guestUrl}}">Restore access</a></p>
 '@
         },
         [pscustomobject]@{
             key = 'deleted'; label = 'Guest removed'; audience = 'owner'
             description = 'Sent to the owner when the grace period lapses and the guest account is deleted.'
-            tokens = $common + @('guest.displayName', 'guest.email', 'owner.displayName')
+            tokens = $common + @('guest.displayName', 'guest.email', 'owner.displayName', 'guestUrl')
             subject = '{{guest.displayName}} has been removed'
             body = @'
 <p>Hello {{owner.displayName}},</p>
@@ -142,7 +142,7 @@ function Get-CBEmailCatalog {
         [pscustomobject]@{
             key = 'inactivityWarning'; label = 'Inactive guest warning'; audience = 'owner'
             description = 'Sent to the owner when a guest has not signed in for longer than the inactivity threshold, before anything is done about it.'
-            tokens = $common + @('guest.displayName', 'guest.email', 'owner.displayName', 'lastSignIn', 'inactiveDays')
+            tokens = $common + @('guest.displayName', 'guest.email', 'owner.displayName', 'lastSignIn', 'inactiveDays', 'guestUrl')
             subject = '{{guest.displayName}} has not signed in for {{inactiveDays}} days'
             body = @'
 <p>Hello {{owner.displayName}},</p>
@@ -463,6 +463,7 @@ function Get-CBSampleTokenValue {
         lastSignIn      = [DateTime]::UtcNow.AddDays(-120).ToString('d MMMM yyyy')
         inactiveDays    = '120'
         redeemUrl       = 'https://example.invalid/redeem-link'
+        guestUrl        = "$portalUrl/#guest/00000000-0000-0000-0000-000000000000/renew"
         shareName       = 'Q3 Supplier Proposal.docx'
         shareKind       = 'file'
         shareUrl        = 'https://example.invalid/shared-item'

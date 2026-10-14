@@ -13,6 +13,9 @@
     -KeepData leaves the state storage account behind, so the guest records and
     the activity log survive for audit.
 
+    The resource group is taken from the function app. If it holds anything
+    the deploy did not create, nothing is removed unless -Force is given.
+
 .PARAMETER SenderUpn
     The sender mailbox, used to resolve the tenant and to find the Exchange role
     assignment to remove.
@@ -23,19 +26,32 @@ param(
     [Parameter(Mandatory)][string]$SenderUpn,
     [string]$ResourceGroup = 'rg-collaborate',
     [string]$AppName,
-    [switch]$KeepData
+    [switch]$KeepData,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
 
 function Write-Step { param([string]$Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
 
+function Format-AzArgsRedacted {
+    # Az arguments as text for an error message, with keys, SAS tokens and
+    # connection strings masked.
+    param([string[]]$AzArgs)
+    $secretFlags = @('--account-key', '--sas-token', '--connection-string')
+    $shown = for ($i = 0; $i -lt $AzArgs.Count; $i++) {
+        if ($i -gt 0 -and $secretFlags -contains $AzArgs[$i - 1]) { '***' }
+        else { $AzArgs[$i] -replace '(?i)(AccountKey=|SharedAccessSignature=|sig=)[^;&\s"]+', '${1}***' }
+    }
+    return ($shown -join ' ')
+}
+
 function Invoke-Az {
     param([Parameter(Mandatory)][string[]]$AzArgs, [switch]$AllowFail)
     if ($AzArgs -notcontains '--only-show-errors') { $AzArgs += '--only-show-errors' }
     $out = & az @AzArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
-        if (-not $AllowFail) { throw "az $($AzArgs -join ' ') failed:`n$out" }
+        if (-not $AllowFail) { throw "az $(Format-AzArgsRedacted -AzArgs $AzArgs) failed:`n$(Format-AzArgsRedacted -AzArgs @("$out"))" }
         return $null
     }
     return $out
@@ -78,6 +94,34 @@ catch [System.Net.Http.HttpRequestException] {
 $stableSuffix = Get-StableSuffix -Seed $tenantId
 if (-not $AppName) { $AppName = "func-collaborate-$stableSuffix" }
 $StateStorage = "cbstate$stableSuffix"
+$WebStorage = "cbweb$stableSuffix"
+$LandStorage = "cbland$stableSuffix"
+
+# --- Which resource group, and is it only Collaborate's? ---------------------
+# Checked before anything is removed, Exchange and Entra included.
+$appRg = Get-AzScalar (Invoke-Az -AzArgs @('functionapp', 'list', '--query', "[?name=='$AppName'].resourceGroup | [0]", '-o', 'tsv') -AllowFail)
+if ($appRg -and $appRg -ne $ResourceGroup) {
+    Write-Warning "Function app '$AppName' lives in resource group '$appRg', not '$ResourceGroup'; using '$appRg'."
+    $ResourceGroup = $appRg
+}
+$rgExists = "$(Get-AzScalar (Invoke-Az -AzArgs @('group', 'exists', '--name', $ResourceGroup) -AllowFail))" -eq 'true'
+if ($rgExists) {
+    $resources = @(Invoke-Az -AzArgs @('resource', 'list', '--resource-group', $ResourceGroup, '--query', '[].{name:name,type:type,id:id}', '-o', 'json') | Out-String | ConvertFrom-Json)
+    $planId = Get-AzScalar (Invoke-Az -AzArgs @('functionapp', 'show', '--name', $AppName, '--resource-group', $ResourceGroup, '--query', 'serverFarmId', '-o', 'tsv') -AllowFail)
+    # What the deploy creates, plus what Application Insights adds by itself.
+    $ownNames = @($StateStorage, $WebStorage, $LandStorage, $AppName, "log-$AppName",
+        'Application Insights Smart Detection', "Failure Anomalies - $AppName")
+    $foreign = @($resources | Where-Object { $_ -and $ownNames -notcontains "$($_.name)" -and -not ($planId -and "$($_.id)" -eq $planId) })
+    if ($foreign.Count -gt 0) {
+        Write-Warning "Resource group '$ResourceGroup' contains resources that are not Collaborate's:"
+        $foreign | ForEach-Object { Write-Warning "  $($_.type)  $($_.name)" }
+        if (-not $Force) {
+            throw "Refusing to remove anything: '$ResourceGroup' is not Collaborate's alone. Move those resources out, or re-run with -Force to delete them along with it."
+        }
+        Write-Warning '-Force given: they will be deleted too.'
+    }
+}
+else { Write-Warning "Resource group '$ResourceGroup' does not exist; only Exchange and Entra are cleaned up." }
 
 Write-Host "Tenant       : $tenantId"
 Write-Host "Resource group: $ResourceGroup"

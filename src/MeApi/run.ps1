@@ -34,6 +34,5 @@ try {
     Send-Json -Status 200 -Object (Get-CBMePayload -Caller $caller)
 }
 catch {
-    Write-Error "MeApi failed: $($_.Exception.Message)"
-    Send-Json -Status 500 -Object @{ error = $_.Exception.Message }
+    Send-Json -Status 500 -Object (Get-CBErrorResponse -Caller $caller -ErrorRecord $_ -Name 'MeApi')
 }

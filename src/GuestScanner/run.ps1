@@ -102,12 +102,16 @@ Invoke-CBFunctionRun -Name 'GuestScanner' -Script {
 
             if ($null -ne $directory -and -not $directory.ContainsKey($guestId)) {
                 if ($state -eq 'deleted') { continue }
+                # The listing is eventually consistent: a guest created minutes
+                # ago can be missing from it. Only a 404 on the id closes the row.
+                if (-not (Test-CBDirectoryUserGone -UserId $guestId)) { continue }
                 # Removed by somebody else, or by us on a previous run whose row
                 # write did not land. Recorded, not deleted: the row is the audit
                 # trail for a guest that once existed.
                 Save-CBGuestRecord -OwnerId "$($row.PartitionKey)" -GuestId $guestId -Properties @{
                     State        = 'deleted'
                     DeletedAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+                    EndedOutside = 'true'
                 }
                 Write-CBActivity -EventName "$($row.Email) no longer exists in Entra" -OwnerId "$($row.PartitionKey)" `
                     -GuestId $guestId -GuestUpn "$($row.Email)" -GuestDisplayName "$($row.DisplayName)" `
@@ -126,7 +130,9 @@ Invoke-CBFunctionRun -Name 'GuestScanner' -Script {
             # Inactivity is only considered when the ordinary lifecycle has
             # nothing to say, so a guest about to expire anyway is never also
             # chased for being idle.
-            if ($settings.inactivity.enabled) {
+            # Only with real sign-in data for this guest: without the licence, or
+            # without an entry, "never signed in" would be a guess.
+            if ($settings.inactivity.enabled -and $signIn.Available -and $signIn.Users.ContainsKey($guestId)) {
                 $stale = Get-CBInactivityDecision -Row $row -Settings $settings -Now $now -SignIn $signIn.Users["$guestId"]
                 if ($stale.Action -eq 'notify') {
                     [void](Invoke-CBInactivityNotice -Row $row -Decision $stale -Settings $settings)
@@ -136,12 +142,24 @@ Invoke-CBFunctionRun -Name 'GuestScanner' -Script {
                     # Routed through the same queue and the same storm guard as
                     # an ordinary expiry. The row's end date is brought forward
                     # so the block decision holds when the processor re-checks it.
-                    Save-CBGuestRecord -OwnerId "$($row.PartitionKey)" -GuestId $guestId -Properties @{
-                        ExpiresOn = (Get-CBExpiryDateString -Days -1 -From $now)
-                        Reason    = "$($row.Reason) (ended for inactivity: $($stale.Reason))"
+                    # In simulation only the log entry is written: moving the date
+                    # would make the guest expire for real once simulation is off.
+                    if ($settings.dryRun) {
+                        Write-CBActivity -EventName "Would end access for $($row.Email): $($stale.Reason)" -OwnerId "$($row.PartitionKey)" `
+                            -GuestId $guestId -GuestUpn "$($row.Email)" -GuestDisplayName "$($row.DisplayName)" -Simulated `
+                            -Detail @{ inactiveDays = $stale.Days }
                     }
-                    Send-CBGuestActionMessage -Action 'block' -Row $row -Reason "inactive: $($stale.Reason)"
-                    $queued.block = [int]$queued.block + 1
+                    else {
+                        $endDate = Get-CBExpiryDateString -Days -1 -From $now
+                        try { Set-CBGuestExpiryAttribute -GuestId $guestId -ExpiresOn $endDate -Settings $settings }
+                        catch { Write-Warning "Could not write the new end date onto $($row.Email): $($_.Exception.Message)" }
+                        Save-CBGuestRecord -OwnerId "$($row.PartitionKey)" -GuestId $guestId -Properties @{
+                            ExpiresOn = $endDate
+                            Reason    = ConvertTo-CBBoundedString -Value "$($row.Reason) (ended for inactivity: $($stale.Reason))" -MaxLength 400
+                        }
+                        Send-CBGuestActionMessage -Action 'block' -Row $row -Reason "inactive: $($stale.Reason)"
+                        $queued.block = [int]$queued.block + 1
+                    }
                     $idle++
                 }
             }

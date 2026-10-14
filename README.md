@@ -32,6 +32,15 @@ In [Azure Cloud Shell](https://shell.azure.com), PowerShell:
 iex (irm https://raw.githubusercontent.com/jflieben/Collaborate/main/install.ps1)
 ```
 
+To install one specific release (the release notes carry this line for each
+version), pin both the installer and the version:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/jflieben/Collaborate/v0.7.1/install.ps1))) -Version 0.7.1
+```
+
+Downloads are verified against the release's SHA-256 checksums.
+
 Or from a local clone:
 
 ```powershell

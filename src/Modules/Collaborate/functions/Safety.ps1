@@ -15,9 +15,8 @@
 #   count / user|<oid>|<date> -> invitations sent today, per employee
 #   meta  / guestCount       -> last known guest population (percent ceiling)
 #
-# The counter increment is read-modify-write, so under heavy queue concurrency it
-# can undercount by a few; the numeric cap has headroom and the percent ceiling is
-# a second backstop, so a small race never defeats the guard.
+# Counters are incremented with an ETag check and retried on conflict, so the
+# queue processor scaling out cannot lose increments.
 
 $script:CBSafetyActions = @('invite', 'block', 'delete')
 
@@ -81,17 +80,39 @@ function Get-CBSafetyCount {
 }
 
 function Add-CBSafetyCount {
-    [CmdletBinding()] param([Parameter(Mandatory)][string]$Key)
+    <#
+    .SYNOPSIS
+        Adds to today's counter. -Delta -1 refunds an action that did not happen.
+    #>
+    [CmdletBinding()] param([Parameter(Mandatory)][string]$Key, [int]$Delta = 1)
     $tables = Get-CBTableNames
     $today = [DateTimeOffset]::UtcNow.ToString('yyyy-MM-dd')
-    $current = Get-CBSafetyCount -Key $Key -Date $today
-    Merge-CBTableEntity -Table $tables.Safety -PartitionKey 'count' -RowKey ("$Key|$today") -Properties @{
-        Count      = [string]($current + 1)
-        Key        = $Key
-        Date       = $today
-        UpdatedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    $rk = ConvertTo-CBODataKey "$Key|$today"
+    $path = "$($tables.Safety)(PartitionKey='count',RowKey='$rk')"
+
+    # Optimistic concurrency: read with its ETag, write only if unchanged, retry
+    # on 412 (somebody else wrote) or 409 (somebody else created it first).
+    for ($attempt = 1; $attempt -le 8; $attempt++) {
+        $read = Invoke-CBTable -Method Get -Path $path -Raw
+        $current = 0
+        if ($read.StatusCode -lt 400 -and $read.Body) { [void][int]::TryParse("$($read.Body.Count)", [ref]$current) }
+        $next = [Math]::Max(0, $current + $Delta)
+        $entity = @{
+            PartitionKey = 'count'; RowKey = "$Key|$today"
+            Count = [string]$next; Key = $Key; Date = $today; UpdatedUtc = [DateTimeOffset]::UtcNow.ToString('o')
+        }
+        if ($read.StatusCode -eq 404) {
+            $write = Invoke-CBTable -Method Post -Path $tables.Safety -Body $entity -ExtraHeaders @{ Prefer = 'return-no-content' } -Raw
+        }
+        else {
+            $etag = "$(@($read.Headers['ETag'])[0])"
+            $write = Invoke-CBTable -Method Merge -Path $path -Body $entity -ExtraHeaders @{ 'If-Match' = $(if ($etag) { $etag } else { '*' }) } -Raw
+        }
+        if ($write.StatusCode -lt 400) { return $next }
+        if ($write.StatusCode -notin @(409, 412)) { throw "Could not update the safety counter '$Key' (HTTP $($write.StatusCode))." }
+        Start-Sleep -Milliseconds (Get-Random -Minimum 50 -Maximum 400)
     }
-    return ($current + 1)
+    throw "Could not update the safety counter '$Key' after repeated conflicts."
 }
 
 function Set-CBGuestCount {
@@ -164,6 +185,11 @@ function Test-CBStormGuard {
     }
 
     if ($trip) {
+        # Invitations are what employees do on a busy day; hitting their cap
+        # refuses more invitations but must not stop expiry and cleanup.
+        if ($Action -eq 'invite') {
+            return [pscustomobject]@{ Allowed = $false; Reason = "The tenant-wide limit of $cap invitations a day has been reached. Try again tomorrow, or ask an administrator to raise it."; Paused = $false }
+        }
         Set-CBPaused -Reason $trip -Action $Action
         return [pscustomobject]@{ Allowed = $false; Reason = $trip; Paused = $true }
     }

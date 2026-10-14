@@ -140,19 +140,28 @@ function Submit-CBGuestMail {
         return @{ Sent = $false; Handed = $false; Message = $null }
     }
 
+    # One parked message per guest. If one is already waiting, this one goes
+    # from the shared mailbox now rather than overwriting it.
+    $existing = Get-CBGuestRow -GuestId $GuestId -OwnerHint $OwnerId
+    if ($existing -and "$($existing.PendingMailJson)") {
+        return @{ Sent = [bool](Send-CBTemplateMail -Key $Key -To $To -Values $Values -Settings $Settings); Handed = $false; Message = $null }
+    }
+
     $message = Get-CBOutboxMessage -Key $Key -To $To -Values $Values -GuestId $GuestId -Settings $Settings
     if (-not $message) { return @{ Sent = $false; Handed = $false; Message = $null } }
 
     Save-CBGuestRecord -OwnerId $OwnerId -GuestId $GuestId -Properties @{
         PendingMailJson  = (ConvertTo-CBPendingMail -Key $Key -To $To -Values $Values)
         PendingMailSince = [DateTimeOffset]::UtcNow.ToString('o')
+        # Whoever was handed it may report on it, owner or not.
+        PendingMailBy    = "$($Caller.Oid)"
     }
     return @{ Sent = $false; Handed = $true; Message = $message }
 }
 
 function Clear-CBPendingMail {
     [CmdletBinding()] param([Parameter(Mandatory)][AllowEmptyString()][string]$OwnerId, [Parameter(Mandatory)][string]$GuestId)
-    Save-CBGuestRecord -OwnerId $OwnerId -GuestId $GuestId -Properties @{ PendingMailJson = ''; PendingMailSince = '' }
+    Save-CBGuestRecord -OwnerId $OwnerId -GuestId $GuestId -Properties @{ PendingMailJson = ''; PendingMailSince = ''; PendingMailBy = '' }
 }
 
 function Send-CBPendingMailFromServicedesk {
@@ -208,8 +217,14 @@ function Complete-CBOutboxMessage {
     # The same access rule as everything else about a guest: the owner or an
     # administrator. A report about somebody else's guest is not a small lie, it
     # is a way to make their invitation be re-sent from the service desk.
+    # The person the message was handed to may also report, so a colleague who
+    # wrote to somebody else's guest is not answered with a 404 and a resend.
     $access = Test-CBGuestAccess -Caller $Caller -GuestId $GuestId
-    if (-not $access.Ok) { return $access }
+    if (-not $access.Ok) {
+        $parked = Get-CBGuestRow -GuestId $GuestId
+        if (-not $parked -or "$($parked.PendingMailBy)" -ne $Caller.Oid) { return $access }
+        $access = @{ Ok = $true; Row = $parked }
+    }
     $row = $access.Row
 
     if (-not "$($row.PendingMailJson)") {

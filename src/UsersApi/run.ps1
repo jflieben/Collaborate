@@ -56,6 +56,5 @@ try {
     Send-Json -Status 200 -Object @{ items = $items; note = $note }
 }
 catch {
-    Write-Error "UsersApi failed: $($_.Exception.Message)"
-    Send-Json -Status 500 -Object @{ error = $_.Exception.Message }
+    Send-Json -Status 500 -Object (Get-CBErrorResponse -Caller $caller -ErrorRecord $_ -Name 'UsersApi')
 }

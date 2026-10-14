@@ -57,6 +57,22 @@ function Get-CBPortalBanner {
     return @($banners)
 }
 
+function Get-CBErrorResponse {
+    <#
+    .SYNOPSIS
+        The body of a 500. Administrators get the exception text; everybody else
+        gets a reference to quote, because the text can carry storage URLs and
+        other internals. The full text is logged under the same reference.
+    #>
+    [CmdletBinding()] param($Caller, [Parameter(Mandatory)]$ErrorRecord, [string]$Name = 'API')
+    $ref = [Guid]::NewGuid().ToString('N').Substring(0, 12)
+    $text = "$($ErrorRecord.Exception.Message)"
+    Write-Warning "$Name failed [$ref]: $text"
+    # Graph errors are written for people (New-CBGraphError keeps the URL out).
+    if (($Caller -and $Caller.IsAdmin) -or $text -like 'Graph *') { return @{ error = $text; reference = $ref } }
+    return @{ error = "Something went wrong on our side. Quote reference $ref to the service desk if it keeps happening."; reference = $ref }
+}
+
 function Get-CBUserLanguage {
     <#
     .SYNOPSIS

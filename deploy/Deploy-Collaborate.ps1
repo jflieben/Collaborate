@@ -57,7 +57,12 @@
 .PARAMETER PublicWithSso
     Leave the portal and API reachable from any address, relying on Entra sign-in
     and your Conditional Access policies as the only perimeter. Use this when
-    people work from home and you do not have fixed egress ranges.
+    people work from home and you do not have fixed egress ranges. On a re-run it
+    also lifts a lockdown an earlier run applied.
+
+.PARAMETER PruneUnlistedPermissions
+    Remove application and delegated permissions that are granted but no longer
+    listed in deploy/permissions.json. Without it they are only reported.
 
 .EXAMPLE
     ./Deploy-Collaborate.ps1 -SubscriptionId <sub> -Location westeurope `
@@ -84,12 +89,28 @@ param(
     # here (plus your detected address outside Cloud Shell).
     [string[]]$AllowedIp,
     [switch]$PublicWithSso,
-    [switch]$SkipNetworkLockdown
+    [switch]$SkipNetworkLockdown,
+
+    # Remove granted permissions that permissions.json no longer lists. Without
+    # it they are only reported.
+    [switch]$PruneUnlistedPermissions
 )
 
 $ErrorActionPreference = 'Stop'
 
 function Write-Step { param([string]$Message) Write-Host "`n=== $Message ===" -ForegroundColor Cyan }
+
+function Format-AzArgsRedacted {
+    # Az arguments as text for an error message, with keys, SAS tokens and
+    # connection strings masked.
+    param([string[]]$AzArgs)
+    $secretFlags = @('--account-key', '--sas-token', '--connection-string')
+    $shown = for ($i = 0; $i -lt $AzArgs.Count; $i++) {
+        if ($i -gt 0 -and $secretFlags -contains $AzArgs[$i - 1]) { '***' }
+        else { $AzArgs[$i] -replace '(?i)(AccountKey=|SharedAccessSignature=|sig=)[^;&\s"]+', '${1}***' }
+    }
+    return ($shown -join ' ')
+}
 
 function Invoke-Az {
     param([Parameter(Mandatory)][string[]]$AzArgs, [switch]$AllowFail)
@@ -98,7 +119,7 @@ function Invoke-Az {
     if ($AzArgs -notcontains '--only-show-errors') { $AzArgs += '--only-show-errors' }
     $out = & az @AzArgs 2>&1
     if ($LASTEXITCODE -ne 0) {
-        if (-not $AllowFail) { throw "az $($AzArgs -join ' ') failed:`n$out" }
+        if (-not $AllowFail) { throw "az $(Format-AzArgsRedacted -AzArgs $AzArgs) failed:`n$(Format-AzArgsRedacted -AzArgs @("$out"))" }
         # Tolerated failure: return nothing, so truthiness checks do not mistake
         # the error text for a value.
         return $null
@@ -125,6 +146,43 @@ function Invoke-AzRestJson {
             '--headers', 'Content-Type=application/json', '--body', "@$tmp") -AllowFail:$AllowFail
     }
     finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+}
+
+function Test-SenderScopeFilter {
+    # True when an Exchange scope filter matches exactly the one mailbox: either
+    # "PrimarySmtpAddress -eq '<addr>'" or that plus the "Name -ne 'CB-...-none'"
+    # tautology this script adds. Exchange may add parentheses, so they are ignored.
+    param([string]$Filter, [Parameter(Mandatory)][string]$Address)
+    $norm = (("$Filter" -replace '[()]', '') -replace '\s+', ' ').Trim()
+    $addr = [regex]::Escape($Address)
+    return [bool]($norm -match "^(?i)PrimarySmtpAddress -eq '$addr'( -and Name -ne 'CB-[^']+-none')?$")
+}
+
+function Remove-CBAppAccessRule {
+    # Removes the access restrictions an earlier run added (named CB-*).
+    param([Parameter(Mandatory)][string]$AppName, [Parameter(Mandatory)][string]$ResourceGroup)
+    $existingRules = (Invoke-Az -AzArgs @('functionapp', 'config', 'access-restriction', 'show', '--name', $AppName, '--resource-group', $ResourceGroup, '-o', 'json') -AllowFail | Out-String | ConvertFrom-Json)
+    foreach ($rule in @($existingRules.ipSecurityRestrictions)) {
+        if ($rule.name -like 'CB-*') {
+            Invoke-Az -AzArgs @('functionapp', 'config', 'access-restriction', 'remove', '--name', $AppName, '--resource-group', $ResourceGroup, '--rule-name', $rule.name) -AllowFail | Out-Null
+        }
+    }
+}
+
+function Sync-CBStorageIpRule {
+    # Makes the account's IP rules exactly the wanted set: adds the missing ones
+    # and removes addresses no longer allowed.
+    param([Parameter(Mandatory)][string]$Account, [Parameter(Mandatory)][string]$ResourceGroup, [string[]]$Wanted)
+    $wantedList = @($Wanted | Where-Object { $_ })
+    $current = @(Invoke-Az -AzArgs @('storage', 'account', 'network-rule', 'list', '--account-name', $Account, '--resource-group', $ResourceGroup,
+            '--query', 'ipRules[].ipAddressOrRange', '-o', 'tsv') -AllowFail | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+    foreach ($ip in @($wantedList | Where-Object { $current -notcontains $_ })) {
+        Invoke-Az -AzArgs @('storage', 'account', 'network-rule', 'add', '--account-name', $Account, '--resource-group', $ResourceGroup, '--ip-address', $ip) -AllowFail | Out-Null
+    }
+    foreach ($ip in @($current | Where-Object { $wantedList -notcontains $_ })) {
+        Write-Host "Removing $ip from the $Account firewall (no longer allowed)."
+        Invoke-Az -AzArgs @('storage', 'account', 'network-rule', 'remove', '--account-name', $Account, '--resource-group', $ResourceGroup, '--ip-address', $ip) -AllowFail | Out-Null
+    }
 }
 
 function Get-StableSuffix {
@@ -311,26 +369,39 @@ $queueEndpoint = (Get-AzScalar (Invoke-Az -AzArgs @('storage', 'account', 'show'
 # 2. Portal: serves the signed-in single-page app. The managed identity gets NO
 #    role here, so a runtime compromise cannot rewrite the page that holds admin
 #    sessions. Only this script writes to it, with the account key, at admin time.
+#    Blob public access stays off: the static website endpoint serves $web anyway.
 Invoke-Az -AzArgs @('storage', 'account', 'create', '--name', $WebStorage, '--resource-group', $ResourceGroup, '--location', $Location,
-    '--sku', 'Standard_LRS', '--kind', 'StorageV2', '--min-tls-version', 'TLS1_2', '--allow-blob-public-access', 'true') | Out-Null
+    '--sku', 'Standard_LRS', '--kind', 'StorageV2', '--min-tls-version', 'TLS1_2', '--allow-blob-public-access', 'false') | Out-Null
 
 # 3. Public welcome page: no data, no auth, no tokens. The app CAN write here so
 #    branding and copy stay editable in the portal. Versioning and soft delete are
 #    on because that write access is the one thing traded away, and this is how a
 #    change is caught and undone (the Watchdog also re-hashes the page daily).
 Invoke-Az -AzArgs @('storage', 'account', 'create', '--name', $LandStorage, '--resource-group', $ResourceGroup, '--location', $Location,
-    '--sku', 'Standard_LRS', '--kind', 'StorageV2', '--min-tls-version', 'TLS1_2', '--allow-blob-public-access', 'true') | Out-Null
+    '--sku', 'Standard_LRS', '--kind', 'StorageV2', '--min-tls-version', 'TLS1_2', '--allow-blob-public-access', 'false') | Out-Null
+# Explicit for accounts an older version created with public access on.
+foreach ($acct in @($WebStorage, $LandStorage)) {
+    Invoke-Az -AzArgs @('storage', 'account', 'update', '--name', $acct, '--resource-group', $ResourceGroup, '--allow-blob-public-access', 'false') -AllowFail | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Could not switch off blob public access on $acct." }
+}
 Invoke-Az -AzArgs @('storage', 'account', 'blob-service-properties', 'update', '--account-name', $LandStorage, '--resource-group', $ResourceGroup,
     '--enable-versioning', 'true', '--enable-delete-retention', 'true', '--delete-retention-days', '30') -AllowFail | Out-Null
 $landId = Get-AzScalar (Invoke-Az -AzArgs @('storage', 'account', 'show', '--name', $LandStorage, '--resource-group', $ResourceGroup, '--query', 'id', '-o', 'tsv'))
 
-# Static website hosting on both public-facing accounts.
+# Static website hosting on both public-facing accounts. The portal account is
+# firewalled after the first run and this machine is usually outside it, so
+# there it is configured inside the portal upload's firewall window instead.
 $webKey = Get-AzScalar (Invoke-Az -AzArgs @('storage', 'account', 'keys', 'list', '--account-name', $WebStorage, '--resource-group', $ResourceGroup, '--query', '[0].value', '-o', 'tsv'))
 $landKey = Get-AzScalar (Invoke-Az -AzArgs @('storage', 'account', 'keys', 'list', '--account-name', $LandStorage, '--resource-group', $ResourceGroup, '--query', '[0].value', '-o', 'tsv'))
-Invoke-Az -AzArgs @('storage', 'blob', 'service-properties', 'update', '--account-name', $WebStorage, '--account-key', $webKey,
-    '--static-website', '--index-document', 'index.html', '--404-document', 'index.html') | Out-Null
-Invoke-Az -AzArgs @('storage', 'blob', 'service-properties', 'update', '--account-name', $LandStorage, '--account-key', $landKey,
-    '--static-website', '--index-document', 'welcome.html', '--404-document', 'welcome.html') | Out-Null
+$webDefaultAction = Get-AzScalar (Invoke-Az -AzArgs @('storage', 'account', 'show', '--name', $WebStorage, '--resource-group', $ResourceGroup, '--query', 'networkRuleSet.defaultAction', '-o', 'tsv') -AllowFail)
+$webStaticPending = $true
+if ("$webDefaultAction" -ne 'Deny') {
+    $webStaticPending = -not (Set-CBStaticWebsite -Account $WebStorage -IndexDocument 'index.html' -NotFoundDocument 'index.html' -AccountKey $webKey)
+}
+if ($webStaticPending) { Write-Host "Static website on $WebStorage is configured during the portal upload." }
+if (-not (Set-CBStaticWebsite -Account $LandStorage -IndexDocument 'welcome.html' -NotFoundDocument 'welcome.html' -AccountKey $landKey)) {
+    throw "Could not enable static website hosting on $LandStorage."
+}
 
 # CORS on the public account. The portal's sign-in screen runs before any token
 # exists, so it reads branding from assets/branding.json on THIS account, which
@@ -367,10 +438,17 @@ if (-not $aiConn) { Write-Warning 'Could not create Application Insights; contin
 
 # Log every data-plane write to the public welcome account. The app is allowed to
 # write there, so the control is evidence rather than prevention.
+# The JSON goes through a file: az.cmd on Windows strips inline quotes.
 if ($workspaceId) {
-    Invoke-Az -AzArgs @('monitor', 'diagnostic-settings', 'create', '--name', 'cb-public-writes',
-        '--resource', "$landId/blobServices/default", '--workspace', $workspaceId,
-        '--logs', '[{"category":"StorageWrite","enabled":true},{"category":"StorageDelete","enabled":true}]') -AllowFail | Out-Null
+    $logsFile = Join-Path ([System.IO.Path]::GetTempPath()) ("cblogs-$([Guid]::NewGuid().ToString('N')).json")
+    $logsJson = @(@{ category = 'StorageWrite'; enabled = $true }, @{ category = 'StorageDelete'; enabled = $true }) | ConvertTo-Json -AsArray
+    [System.IO.File]::WriteAllText($logsFile, $logsJson, (New-Object System.Text.UTF8Encoding($false)))
+    try {
+        Invoke-Az -AzArgs @('monitor', 'diagnostic-settings', 'create', '--name', 'cb-public-writes',
+            '--resource', "$landId/blobServices/default", '--workspace', $workspaceId, '--logs', "@$logsFile") -AllowFail | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Could not enable write logging on $LandStorage." }
+    }
+    finally { Remove-Item $logsFile -Force -ErrorAction SilentlyContinue }
 }
 
 # --- Function app ------------------------------------------------------------
@@ -378,16 +456,33 @@ Write-Step 'Function app (Flex Consumption)'
 $appExists = Get-AzScalar (Invoke-Az -AzArgs @('functionapp', 'show', '--name', $AppName, '--resource-group', $ResourceGroup, '--query', 'name', '-o', 'tsv') -AllowFail)
 if ($appExists) { Write-Host "Function app '$AppName' already exists; reusing it." }
 else {
+    # The deployment container is reached with the managed identity, so no
+    # storage key lands in an app setting.
     Invoke-Az -AzArgs @('functionapp', 'create', '--name', $AppName, '--resource-group', $ResourceGroup,
         '--storage-account', $StateStorage, '--flexconsumption-location', $Location,
-        '--runtime', 'powershell', '--runtime-version', '7.6') | Out-Null
+        '--runtime', 'powershell', '--runtime-version', '7.6',
+        '--deployment-storage-auth-type', 'SystemAssignedIdentity') | Out-Null
 }
 
 # Flex Consumption pins the runtime at create time, so an app created on an older
 # version would otherwise stay there. This PATCH is idempotent.
-Invoke-AzRestJson -Method PATCH -Uri "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Web/sites/$AppName`?api-version=2023-12-01" -Body @{
+$siteUri = "https://management.azure.com/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Web/sites/$AppName"
+Invoke-AzRestJson -Method PATCH -Uri "$siteUri`?api-version=2023-12-01" -Body @{
     properties = @{ functionAppConfig = @{ runtime = @{ name = 'powershell'; version = '7.6' } } }
 } -AllowFail | Out-Null
+
+# Hardening: HTTPS only, TLS 1.2, no FTP, no basic publishing credentials. Code
+# deploys use Entra tokens, not basic auth.
+Invoke-AzRestJson -Method PATCH -Uri "$siteUri`?api-version=2023-12-01" -Body @{ properties = @{ httpsOnly = $true } } -AllowFail | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Warning "Could not set HTTPS only on $AppName." }
+Invoke-AzRestJson -Method PATCH -Uri "$siteUri/config/web?api-version=2023-12-01" -Body @{ properties = @{ minTlsVersion = '1.2' } } -AllowFail | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Warning "Could not set the minimum TLS version on $AppName." }
+Invoke-AzRestJson -Method PATCH -Uri "$siteUri/config/web?api-version=2023-12-01" -Body @{ properties = @{ ftpsState = 'Disabled' } } -AllowFail | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Warning "Could not disable FTP on $AppName." }
+foreach ($policy in @('scm', 'ftp')) {
+    Invoke-AzRestJson -Method PUT -Uri "$siteUri/basicPublishingCredentialsPolicies/$policy`?api-version=2023-12-01" -Body @{ properties = @{ allow = $false } } -AllowFail | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Could not disable basic $policy publishing credentials on $AppName." }
+}
 
 Invoke-Az -AzArgs @('functionapp', 'identity', 'assign', '--name', $AppName, '--resource-group', $ResourceGroup) | Out-Null
 $principalId = Get-AzScalar (Invoke-Az -AzArgs @('functionapp', 'identity', 'show', '--name', $AppName, '--resource-group', $ResourceGroup, '--query', 'principalId', '-o', 'tsv'))
@@ -424,9 +519,29 @@ if ($rbacFailed) {
     Write-Warning "One or more storage role assignments FAILED. You need 'Owner' or 'User Access Administrator'. Grant them to principalId $principalId, then re-run."
 }
 
+# An app created by an older version reaches its deployment container with the
+# state account key (DEPLOYMENT_STORAGE_CONNECTION_STRING). Switch it to the
+# managed identity, and drop the setting only once the switch is confirmed.
+$deployAuthQuery = @('rest', '--method', 'get', '--url', "$siteUri`?api-version=2023-12-01",
+    '--query', 'properties.functionAppConfig.deployment.storage.authentication.type', '-o', 'tsv')
+$deployAuth = Get-AzScalar (Invoke-Az -AzArgs $deployAuthQuery -AllowFail)
+if ("$deployAuth" -ne 'SystemAssignedIdentity' -and -not $rbacFailed) {
+    Write-Host 'Switching code deployment storage to the managed identity...'
+    Invoke-Az -AzArgs @('functionapp', 'deployment', 'config', 'set', '--name', $AppName, '--resource-group', $ResourceGroup,
+        '--deployment-storage-auth-type', 'SystemAssignedIdentity') -AllowFail | Out-Null
+    $deployAuth = Get-AzScalar (Invoke-Az -AzArgs $deployAuthQuery -AllowFail)
+}
+if ("$deployAuth" -eq 'SystemAssignedIdentity') {
+    Invoke-Az -AzArgs @('functionapp', 'config', 'appsettings', 'delete', '--name', $AppName, '--resource-group', $ResourceGroup,
+        '--setting-names', 'DEPLOYMENT_STORAGE_CONNECTION_STRING') -AllowFail | Out-Null
+}
+else {
+    Write-Warning "Code deployment storage still uses the account key (authentication type '$deployAuth'), so DEPLOYMENT_STORAGE_CONNECTION_STRING was left in place."
+}
+
 # --- API permissions ---------------------------------------------------------
 Write-Step 'API permissions (managed identity)'
-$graphRolesFailed = @(Update-CBPermission -PrincipalId $principalId)
+$graphRolesFailed = @(Update-CBPermission -PrincipalId $principalId -PruneUnlisted:$PruneUnlistedPermissions)
 if ($graphRolesFailed.Count -eq 0) { Write-Host 'API permissions reconciled: all required roles are granted.' -ForegroundColor Green }
 
 # --- Exchange Online: mailbox-scoped mail ------------------------------------
@@ -448,25 +563,36 @@ else {
         # carries a tautology that keeps it unique to this deployment while still
         # resolving to the same single mailbox.
         $scopeName = "Collaborate-Sender-$AppName"
+        $uniqueFilter = "PrimarySmtpAddress -eq '$mbxSmtp' -and Name -ne 'CB-$AppName-none'"
         $scope = Get-ManagementScope -Identity $scopeName -ErrorAction SilentlyContinue
         if (-not $scope) {
-            $uniqueFilter = "PrimarySmtpAddress -eq '$mbxSmtp' -and Name -ne 'CB-$AppName-none'"
             try {
                 Write-Host "Creating management scope '$scopeName'..."
                 $scope = New-ManagementScope -Name $scopeName -RecipientRestrictionFilter $uniqueFilter -ErrorAction Stop
             }
             catch {
-                Write-Warning "Could not create a unique scope ($($_.Exception.Message)). Falling back to an existing scope covering $mbxSmtp."
-                $scope = Get-ManagementScope -ErrorAction SilentlyContinue | Where-Object { $_.RecipientFilter -and $_.RecipientFilter -match [regex]::Escape("$mbxSmtp") } | Select-Object -First 1
-                if (-not $scope) { throw "No management scope covers $mbxSmtp and a new one could not be created." }
+                Write-Warning "Could not create a unique scope ($($_.Exception.Message)). Falling back to an existing scope limited to exactly $mbxSmtp."
+                $scope = Get-ManagementScope -ErrorAction SilentlyContinue | Where-Object { Test-SenderScopeFilter -Filter $_.RecipientFilter -Address "$mbxSmtp" } | Select-Object -First 1
+                if (-not $scope) { throw "No management scope is limited to exactly $mbxSmtp and a new one could not be created." }
             }
+        }
+        elseif (-not (Test-SenderScopeFilter -Filter $scope.RecipientFilter -Address "$mbxSmtp")) {
+            # -SenderUpn changed since the last run: move the scope to the new mailbox.
+            Write-Host "Management scope '$scopeName' targets a different mailbox; updating it to $mbxSmtp..."
+            Set-ManagementScope -Identity $scopeName -RecipientRestrictionFilter $uniqueFilter -ErrorAction Stop
+            $scope = Get-ManagementScope -Identity $scopeName -ErrorAction Stop
         }
         else { Write-Host "Management scope '$scopeName' already present." }
 
         $assignName = "CB-$AppName-MailSend"
-        if (-not (Get-ManagementRoleAssignment -Identity $assignName -ErrorAction SilentlyContinue)) {
+        $assignment = Get-ManagementRoleAssignment -Identity $assignName -ErrorAction SilentlyContinue
+        if (-not $assignment) {
             Write-Host 'Assigning scoped "Application Mail.Send" role...'
             $null = New-ManagementRoleAssignment -Name $assignName -App $identityAppId -Role 'Application Mail.Send' -CustomResourceScope $scope.Name -ErrorAction Stop
+        }
+        elseif ("$($assignment.CustomResourceScope)" -and "$($assignment.CustomResourceScope)" -ne "$($scope.Name)") {
+            Write-Host "Role assignment points at scope '$($assignment.CustomResourceScope)'; moving it to '$($scope.Name)'..."
+            Set-ManagementRoleAssignment -Identity $assignName -CustomResourceScope $scope.Name -ErrorAction Stop
         }
         else { Write-Host 'Role assignment already present.' }
 
@@ -512,6 +638,9 @@ Write-Host "Packaging $srcPath ..."
 $pkgStage = Join-Path ([System.IO.Path]::GetTempPath()) "cbpkg-$([Guid]::NewGuid().ToString('N'))"
 Copy-Item -Path $srcPath -Destination $pkgStage -Recurse -Force
 Get-ChildItem -Path $pkgStage -Filter 'local.settings.json*' -Recurse -Force | Remove-Item -Force -ErrorAction SilentlyContinue
+# The code must report the version it is, or the stale-code check on Diagnostics
+# compares CB_VERSION against a manifest nobody bumped and cries wolf.
+Set-CBPackageVersion -StagePath $pkgStage -Version $moduleVersion | Out-Null
 Compress-Archive -Path (Join-Path $pkgStage '*') -DestinationPath $zipPath -Force
 Remove-Item $pkgStage -Recurse -Force -ErrorAction SilentlyContinue
 
@@ -579,9 +708,15 @@ try {
     # Already assigned is the normal case on a re-run, and POSTing it again fails
     # with a conflict. Reporting that as "you need a P1 licence" told an operator
     # to go and fix something that was never broken.
-    $current = Invoke-CBGraphJson -Method GET -AllowFail `
-        -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo?`$select=principalId,appRoleId&`$top=200"
-    $already = @($current.value | Where-Object { "$($_.principalId)" -eq $AdminGroupObjectId -and "$($_.appRoleId)" -eq $adminRoleId })
+    $assignedTo = [System.Collections.Generic.List[object]]::new()
+    $pageUri = "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo?`$select=principalId,appRoleId&`$top=200"
+    while ($pageUri) {
+        $page = Invoke-CBGraphJson -Method GET -AllowFail -Uri $pageUri
+        if (-not $page) { break }
+        foreach ($row in @($page.value)) { if ($row) { $assignedTo.Add($row) } }
+        $pageUri = "$($page.'@odata.nextLink')"
+    }
+    $already = @($assignedTo | Where-Object { "$($_.principalId)" -eq $AdminGroupObjectId -and "$($_.appRoleId)" -eq $adminRoleId })
 
     if ($already.Count -gt 0) {
         Write-Host "'$AdminGroupName' already has Collaborate.Admin." -ForegroundColor Green
@@ -592,7 +727,7 @@ try {
         if ($assigned) { Write-Host "Granted Collaborate.Admin to '$AdminGroupName'." -ForegroundColor Green }
         else {
             Write-Warning "Could not assign the admin group to the Collaborate.Admin role. Assigning a group to an app role requires an Entra ID P1 licence; without it, assign individual users in Entra (Enterprise applications > $webAppName > Users and groups)."
-            if ($deployerOid -and -not @($current.value | Where-Object { "$($_.principalId)" -eq $deployerOid -and "$($_.appRoleId)" -eq $adminRoleId })) {
+            if ($deployerOid -and -not @($assignedTo | Where-Object { "$($_.principalId)" -eq $deployerOid -and "$($_.appRoleId)" -eq $adminRoleId })) {
                 $fallback = Invoke-AzRestJson -Method POST -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$spId/appRoleAssignedTo" `
                     -Body @{ principalId = $deployerOid; resourceId = $spId; appRoleId = $adminRoleId } -AllowFail
                 if ($fallback) { Write-Host "Granted Collaborate.Admin to you ($deployerUpn) so the portal is administrable." -ForegroundColor Yellow }
@@ -607,7 +742,7 @@ try {
 
     # Delegated Graph scopes, consented tenant-wide so no employee is prompted.
     Write-Step 'Delegated permissions (used only on behalf of a signed-in user)'
-    $delegatedFailed = @(Update-CBDelegatedPermission -AppId $appId -AppObjectId $appObjId -ServicePrincipalId $spId)
+    $delegatedFailed = @(Update-CBDelegatedPermission -AppId $appId -AppObjectId $appObjId -ServicePrincipalId $spId -PruneUnlisted:$PruneUnlistedPermissions)
     if ($delegatedFailed.Count -eq 0) { Write-Host 'Delegated permissions consented.' -ForegroundColor Green }
 
     # --- Easy Auth ------------------------------------------------------------
@@ -665,8 +800,9 @@ window.CB_AUTH = {
 
     # A re-run hits the lockdown the last run applied, and the upload comes from
     # wherever the deploy is running rather than from an allowed range.
-    $uploaded = Invoke-CBPortalUpload -Account $WebStorage -ResourceGroup $ResourceGroup `
-        -AccountKey $webKey -Source $webStage -SubscriptionId $SubscriptionId
+    $uploadArgs = @{ Account = $WebStorage; ResourceGroup = $ResourceGroup; AccountKey = $webKey; Source = $webStage; SubscriptionId = $SubscriptionId }
+    if ($webStaticPending) { $uploadArgs.IndexDocument = 'index.html'; $uploadArgs.NotFoundDocument = 'index.html' }
+    $uploaded = Invoke-CBPortalUpload @uploadArgs
     Remove-Item $webStage -Recurse -Force -ErrorAction SilentlyContinue
     if ($uploaded) { Write-Host 'Portal uploaded.' -ForegroundColor Green }
     else { throw "The portal files could not be uploaded to $WebStorage." }
@@ -680,9 +816,24 @@ catch {
 # Applied LAST so nothing earlier in the deploy is affected. The PUBLIC welcome
 # site is never restricted: guests have to reach it from anywhere.
 $networkLocked = $false
+$networkPublic = $false
 $allowedIps = @()
-if ($SkipNetworkLockdown -or $PublicWithSso) {
-    Write-Warning 'Network lockdown skipped: the portal and API stay reachable from any address. Entra sign-in (and your Conditional Access policies) are then the only perimeter.'
+if ($SkipNetworkLockdown) {
+    Write-Warning 'Network settings left as they are (-SkipNetworkLockdown). Without a lockdown, Entra sign-in (and your Conditional Access policies) are the only perimeter.'
+}
+elseif ($PublicWithSso) {
+    # Lift whatever lockdown an earlier run applied, so PUBLIC is the truth.
+    Write-Step 'Network access (public by choice)'
+    try {
+        Remove-CBAppAccessRule -AppName $AppName -ResourceGroup $ResourceGroup
+        Invoke-Az -AzArgs @('functionapp', 'config', 'access-restriction', 'set', '--name', $AppName, '--resource-group', $ResourceGroup, '--default-action', 'Allow') -AllowFail | Out-Null
+        $appOpen = ($LASTEXITCODE -eq 0)
+        Sync-CBStorageIpRule -Account $WebStorage -ResourceGroup $ResourceGroup -Wanted @()
+        Invoke-Az -AzArgs @('storage', 'account', 'update', '--name', $WebStorage, '--resource-group', $ResourceGroup, '--default-action', 'Allow') | Out-Null
+        if ($appOpen) { $networkPublic = $true }
+        else { Write-Warning "Could not set the API's default access to Allow; check Networking on $AppName." }
+    }
+    catch { Write-Warning "Could not fully lift the earlier network restrictions: $($_.Exception.Message)" }
 }
 else {
     Write-Step 'Network access restrictions'
@@ -696,10 +847,7 @@ else {
         $cidrs = @($allowedIps | ForEach-Object { if ($_ -match '/') { $_ } else { "$_/32" } })
         $storageIps = @($allowedIps | ForEach-Object { $_ -replace '/32$', '' })
         try {
-            $existingRules = (Invoke-Az -AzArgs @('functionapp', 'config', 'access-restriction', 'show', '--name', $AppName, '--resource-group', $ResourceGroup, '-o', 'json') -AllowFail | Out-String | ConvertFrom-Json)
-            foreach ($r in @($existingRules.ipSecurityRestrictions)) {
-                if ($r.name -like 'CB-*') { Invoke-Az -AzArgs @('functionapp', 'config', 'access-restriction', 'remove', '--name', $AppName, '--resource-group', $ResourceGroup, '--rule-name', $r.name) -AllowFail | Out-Null }
-            }
+            Remove-CBAppAccessRule -AppName $AppName -ResourceGroup $ResourceGroup
             $prio = 100
             foreach ($cidr in $cidrs) {
                 Invoke-Az -AzArgs @('functionapp', 'config', 'access-restriction', 'add', '--name', $AppName, '--resource-group', $ResourceGroup,
@@ -707,12 +855,15 @@ else {
                 $prio += 10
             }
             Invoke-Az -AzArgs @('functionapp', 'config', 'access-restriction', 'set', '--name', $AppName, '--resource-group', $ResourceGroup, '--default-action', 'Deny') -AllowFail | Out-Null
+            $appDenied = ($LASTEXITCODE -eq 0)
+            # Rules first, then Deny, so the allowed ranges are never shut out.
+            Sync-CBStorageIpRule -Account $WebStorage -ResourceGroup $ResourceGroup -Wanted $storageIps
             Invoke-Az -AzArgs @('storage', 'account', 'update', '--name', $WebStorage, '--resource-group', $ResourceGroup, '--default-action', 'Deny', '--bypass', 'AzureServices') | Out-Null
-            foreach ($ip in $storageIps) {
-                Invoke-Az -AzArgs @('storage', 'account', 'network-rule', 'add', '--account-name', $WebStorage, '--resource-group', $ResourceGroup, '--ip-address', $ip) -AllowFail | Out-Null
+            if ($appDenied) {
+                Write-Host 'Portal and API locked to the allowed ranges; the public welcome page stays reachable.' -ForegroundColor Green
+                $networkLocked = $true
             }
-            Write-Host 'Portal and API locked to the allowed ranges; the public welcome page stays reachable.' -ForegroundColor Green
-            $networkLocked = $true
+            else { Write-Warning "The portal is locked, but the API's default access could not be set to Deny. Set it under Networking on $AppName." }
         }
         catch { Write-Warning "Could not fully apply the network restrictions (finish it in the portal): $($_.Exception.Message)" }
     }
@@ -727,7 +878,9 @@ Write-Host "Welcome page  : $landUrl/  (published when you finish the setup wiza
 Write-Host "Function app  : $AppName"
 Write-Host ''
 if ($networkLocked) { Write-Host "Network       : LOCKED to $($allowedIps -join ', '). The public welcome page is unrestricted." -ForegroundColor Green }
-elseif ($PublicWithSso) { Write-Host 'Network       : PUBLIC by choice (-PublicWithSso). Entra sign-in and your Conditional Access policies are the perimeter.' -ForegroundColor Yellow }
+elseif ($networkPublic) { Write-Host 'Network       : PUBLIC by choice (-PublicWithSso). Entra sign-in and your Conditional Access policies are the perimeter.' -ForegroundColor Yellow }
+elseif ($PublicWithSso) { Write-Host 'Network       : -PublicWithSso was asked for, but an earlier lockdown could not be fully lifted (see the warnings above).' -ForegroundColor Yellow }
+elseif ($SkipNetworkLockdown) { Write-Host 'Network       : left as it was (-SkipNetworkLockdown).' -ForegroundColor Yellow }
 else { Write-Host 'Network       : NOT restricted. Re-run with -AllowedIp <ip/cidr> to lock it down.' -ForegroundColor Yellow }
 Write-Host ''
 
